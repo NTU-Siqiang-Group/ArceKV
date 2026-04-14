@@ -1,6 +1,18 @@
 # ArceKV optimized for In-memory service
+⚠️ This repository contains **environment-specific adaptations** for the TikTok Recommendation Service and **does not represent a faithful implementation of** [ArceKV](https://www.arxiv.org/pdf/2508.03565).
 
-## Pre-requisite
+## Key Modifications
+
+- **Simplified write-stop strategy**  
+  A lightweight write-stop mechanism is used to avoid costly searches over a large parameter space.
+
+- **One SSTable per run**  
+  Each run generates a single SSTable to accelerate in-memory point lookups.
+
+- **Range filter policy removed**  
+  Range filters are excluded because range lookups are rare in this workload, and the computation overhead of maintaining the filter degrades overall performance.
+
+## Dependencies
 - cmake
 - make
 - gcc/g++
@@ -70,3 +82,7 @@ Result on Ubuntu 22.04 with 13th Gen Intel(R) Core(TM) i9-13900K, 128GB RAM, and
 | RocksDB  | 0.8        | 449.571008 | 44.896419  | 494.47  |
 | ArceKV   | 0.9        | 416.868406 | 21.168589  | 438.04  |
 | RocksDB  | 0.9        | 456.469977 | 22.728706  | 479.20  |
+
+# 💼 WIP features
+- [ ] Interface for outside agent to manipulate the structure
+- [ ] On-disk sorted run implementation
