@@ -351,6 +351,70 @@ class FilePicker {
     return false;
   }
 };
+
+class TieredFilePicker {
+ public:
+  TieredFilePicker(const Slice& user_key, const Slice& ikey,
+                   const VersionStorageInfo* storage_info,
+                   const Comparator* user_comparator,
+                   const InternalKeyComparator* internal_comparator)
+      : curr_level_(0),
+        curr_run_(0),
+        hit_file_level_(static_cast<unsigned int>(-1)),
+        storage_info_(storage_info),
+        user_key_(user_key),
+        ikey_(ikey),
+        user_comparator_(user_comparator),
+        internal_comparator_(internal_comparator) {}
+
+  FdWithKeyRange* GetNextFile() {
+    while (curr_level_ <
+           static_cast<unsigned int>(storage_info_->num_non_empty_levels())) {
+      const auto& level_runs = storage_info_->LevelSortedRuns(curr_level_);
+      while (curr_run_ < level_runs.num_runs()) {
+        // Runs are searched from newest to oldest. This assumes
+        // GenerateLevelSortedRunsBrief() preserves recency order for each
+        // level, which later compaction milestones must continue to maintain.
+        const auto& run = level_runs.runs[curr_run_++];
+        if (run.files.num_files == 0) {
+          continue;
+        }
+
+        size_t file_index = static_cast<size_t>(
+            FindFile(*internal_comparator_, run.files, ikey_));
+        if (file_index >= run.files.num_files) {
+          continue;
+        }
+
+        FdWithKeyRange* f = &run.files.files[file_index];
+        if (user_comparator_->CompareWithoutTimestamp(
+                user_key_, ExtractUserKey(f->smallest_key)) < 0 ||
+            user_comparator_->CompareWithoutTimestamp(
+                user_key_, ExtractUserKey(f->largest_key)) > 0) {
+          continue;
+        }
+
+        hit_file_level_ = curr_level_;
+        return f;
+      }
+      ++curr_level_;
+      curr_run_ = 0;
+    }
+    return nullptr;
+  }
+
+  unsigned int GetHitFileLevel() const { return hit_file_level_; }
+
+ private:
+  unsigned int curr_level_;
+  size_t curr_run_;
+  unsigned int hit_file_level_;
+  const VersionStorageInfo* storage_info_;
+  Slice user_key_;
+  Slice ikey_;
+  const Comparator* user_comparator_;
+  const InternalKeyComparator* internal_comparator_;
+};
 }  // anonymous namespace
 
 class FilePickerMultiGet {
@@ -2362,6 +2426,12 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
     return;
   }
 
+  if (storage_info_.IsTiered()) {
+    AddTieredIteratorsForLevel(read_options, soptions, merge_iter_builder,
+                               level, allow_unprepared_value);
+    return;
+  }
+
   auto* arena = merge_iter_builder->GetArena();
   if (level == 0) {
     // Merge all level zero files together since they may overlap
@@ -2416,6 +2486,73 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
   }
 }
 
+void Version::AddTieredRunIterator(const ReadOptions& read_options,
+                                   const FileOptions& soptions,
+                                   MergeIteratorBuilder* merge_iter_builder,
+                                   int level, const LevelFilesBrief& run_files,
+                                   bool allow_unprepared_value) {
+  // Reuse LevelIterator at the sorted-run granularity. This is safe only while
+  // a run preserves the leveled invariant of internally non-overlapping,
+  // smallest-key-sorted SSTs.
+  auto* arena = merge_iter_builder->GetArena();
+  if (run_files.num_files == 1) {
+    std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;
+    const auto& file = run_files.files[0];
+    auto table_iter = cfd_->table_cache()->NewIterator(
+        read_options, soptions, cfd_->internal_comparator(),
+        *file.file_metadata, /*range_del_agg=*/nullptr, mutable_cf_options_,
+        nullptr, cfd_->internal_stats()->GetFileReadHist(level),
+        TableReaderCaller::kUserIterator, arena,
+        /*skip_filters=*/false, /*level=*/level, max_file_size_for_l0_meta_pin_,
+        /*smallest_compaction_key=*/nullptr,
+        /*largest_compaction_key=*/nullptr, allow_unprepared_value,
+        /*range_del_read_seqno=*/nullptr, &tombstone_iter,
+        /*maybe_pin_table_handle=*/true);
+    if (read_options.ignore_range_deletions) {
+      merge_iter_builder->AddIterator(table_iter);
+    } else {
+      merge_iter_builder->AddPointAndTombstoneIterator(
+          table_iter, std::move(tombstone_iter));
+    }
+    return;
+  }
+
+  auto* mem = arena->AllocateAligned(sizeof(LevelIterator));
+  std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr = nullptr;
+  auto level_iter = new (mem) LevelIterator(
+      cfd_->table_cache(), read_options, soptions, cfd_->internal_comparator(),
+      &run_files, mutable_cf_options_,
+      cfd_->internal_stats()->GetFileReadHist(level),
+      TableReaderCaller::kUserIterator, /*skip_filters=*/false, level,
+      /*range_del_agg=*/nullptr,
+      /*compaction_boundaries=*/nullptr, allow_unprepared_value,
+      &tombstone_iter_ptr, db_statistics_, clock_);
+  if (read_options.ignore_range_deletions) {
+    merge_iter_builder->AddIterator(level_iter);
+  } else {
+    merge_iter_builder->AddPointAndTombstoneIterator(
+        level_iter, nullptr /* tombstone_iter */, tombstone_iter_ptr);
+  }
+}
+
+void Version::AddTieredIteratorsForLevel(const ReadOptions& read_options,
+                                         const FileOptions& soptions,
+                                         MergeIteratorBuilder* merge_iter_builder,
+                                         int level,
+                                         bool allow_unprepared_value) {
+  const auto& level_runs = storage_info_.LevelSortedRuns(level);
+  for (const auto& run : level_runs.runs) {
+    AddTieredRunIterator(read_options, soptions, merge_iter_builder, level,
+                         run.files, allow_unprepared_value);
+  }
+
+  if (should_sample_file_read()) {
+    for (FileMetaData* meta : storage_info_.LevelFiles(level)) {
+      sample_file_read_inc(meta);
+    }
+  }
+}
+
 Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
                                          const FileOptions& file_options,
                                          const Slice& smallest_user_key,
@@ -2433,7 +2570,15 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
 
   *overlap = false;
 
-  if (level == 0) {
+  if (storage_info_.IsTiered()) {
+    MergeIteratorBuilder merge_iter_builder(&icmp, &arena,
+                                            false /* prefix_seek_mode */);
+    AddTieredIteratorsForLevel(read_options, file_options, &merge_iter_builder,
+                               level, /*allow_unprepared_value=*/false);
+    ScopedArenaPtr<InternalIterator> iter(merge_iter_builder.Finish());
+    status = OverlapWithIterator(ucmp, smallest_user_key, largest_user_key,
+                                 iter.get(), overlap);
+  } else if (level == 0) {
     for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
       const auto file = &storage_info_.LevelFilesBrief(0).files[i];
       if (AfterFile(ucmp, &smallest_user_key, file) ||
@@ -2761,7 +2906,16 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                 storage_info_.num_non_empty_levels_,
                 &storage_info_.file_indexer_, user_comparator(),
                 internal_comparator());
-  FdWithKeyRange* f = fp.GetNextFile();
+  std::unique_ptr<TieredFilePicker> tiered_fp;
+  FdWithKeyRange* f = nullptr;
+  if (storage_info_.IsTiered()) {
+    tiered_fp = std::make_unique<TieredFilePicker>(
+        user_key, ikey, &storage_info_, user_comparator(),
+        internal_comparator());
+    f = tiered_fp->GetNextFile();
+  } else {
+    f = fp.GetNextFile();
+  }
 
   while (f != nullptr) {
     if (*max_covering_tombstone_seq > 0) {
@@ -2777,17 +2931,22 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         GetPerfLevel() >= PerfLevel::kEnableTimeExceptForMutex &&
         get_perf_context()->per_level_perf_context_enabled;
     StopWatchNano timer(clock_, timer_enabled /* auto_start */);
+    const unsigned int hit_file_level =
+        storage_info_.IsTiered() ? tiered_fp->GetHitFileLevel()
+                                 : fp.GetHitFileLevel();
     *status = table_cache_->Get(
         read_options, *internal_comparator(), *f->file_metadata, ikey,
         &get_context, mutable_cf_options_,
-        cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
-        IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
-                        fp.IsHitFileLastInLevel()),
-        fp.GetHitFileLevel(), max_file_size_for_l0_meta_pin_);
+        cfd_->internal_stats()->GetFileReadHist(hit_file_level),
+        storage_info_.IsTiered()
+            ? false
+            : IsFilterSkipped(static_cast<int>(hit_file_level),
+                              fp.IsHitFileLastInLevel()),
+        hit_file_level, max_file_size_for_l0_meta_pin_);
     // TODO: examine the behavior for corrupted key
     if (timer_enabled) {
       PERF_COUNTER_BY_LEVEL_ADD(get_from_table_nanos, timer.ElapsedNanos(),
-                                fp.GetHitFileLevel());
+                                hit_file_level);
     }
     if (!status->ok()) {
       if (db_statistics_ != nullptr) {
@@ -2816,16 +2975,15 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         }
         break;
       case GetContext::kFound:
-        if (fp.GetHitFileLevel() == 0) {
+        if (hit_file_level == 0) {
           RecordTick(db_statistics_, GET_HIT_L0);
-        } else if (fp.GetHitFileLevel() == 1) {
+        } else if (hit_file_level == 1) {
           RecordTick(db_statistics_, GET_HIT_L1);
-        } else if (fp.GetHitFileLevel() >= 2) {
+        } else if (hit_file_level >= 2) {
           RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
         }
 
-        PERF_COUNTER_BY_LEVEL_ADD(user_key_return_count, 1,
-                                  fp.GetHitFileLevel());
+        PERF_COUNTER_BY_LEVEL_ADD(user_key_return_count, 1, hit_file_level);
 
         if (is_blob_index && do_merge && (value || columns)) {
           Slice blob_index =
@@ -2879,7 +3037,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         *status = Status::Corruption(Status::SubCode::kMergeOperatorFailed);
         return;
     }
-    f = fp.GetNextFile();
+    f = storage_info_.IsTiered() ? tiered_fp->GetNextFile() : fp.GetNextFile();
   }
   if (db_statistics_ != nullptr) {
     get_context.ReportCounters();
@@ -2926,6 +3084,20 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
   if (merge_operator_) {
     pinned_iters_mgr.StartPinning();
   }
+
+  if (storage_info_.IsTiered()) {
+    for (auto iter = range->begin(); iter != range->end(); ++iter) {
+      SequenceNumber seq = kMaxSequenceNumber;
+      bool value_found = false;
+      Get(read_options, *iter->lkey, iter->value, iter->columns,
+          iter->timestamp, iter->s, &iter->merge_context,
+          &iter->max_covering_tombstone_seq, &pinned_iters_mgr, &value_found,
+          &iter->key_exists, &seq, callback, &iter->is_blob_index,
+          /*do_merge=*/true);
+    }
+    return;
+  }
+
   uint64_t tracing_mget_id = BlockCacheTraceHelper::kReservedGetId;
 
   if (vset_ && vset_->block_cache_tracer_ &&
@@ -3423,6 +3595,50 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
   }
 }
 
+void VersionStorageInfo::GenerateLevelSortedRunsBrief() {
+  level_sorted_runs_brief_.resize(num_non_empty_levels_);
+  if (!IsTiered()) {
+    return;
+  }
+
+  for (int level = 0; level < num_non_empty_levels_; ++level) {
+    auto& level_runs = level_sorted_runs_brief_[level].runs;
+    level_runs.clear();
+    std::unordered_map<uint64_t, std::vector<FileMetaData*>> runs_by_id;
+    runs_by_id.reserve(files_[level].size());
+
+    for (auto* file : files_[level]) {
+      assert(file != nullptr);
+      runs_by_id[file->sorted_run_id].push_back(file);
+    }
+
+    for (auto& entry : runs_by_id) {
+      auto& run_files = entry.second;
+      std::sort(run_files.begin(), run_files.end(),
+                [this](const FileMetaData* lhs, const FileMetaData* rhs) {
+                  return internal_comparator_->Compare(lhs->smallest,
+                                                       rhs->smallest) < 0;
+                });
+    }
+
+    std::vector<uint64_t> run_ids;
+    run_ids.reserve(runs_by_id.size());
+    for (const auto& entry : runs_by_id) {
+      run_ids.push_back(entry.first);
+    }
+    std::sort(run_ids.begin(), run_ids.end(),
+              [](uint64_t lhs, uint64_t rhs) { return lhs > rhs; });
+
+    level_runs.reserve(run_ids.size());
+    for (uint64_t run_id : run_ids) {
+      level_runs.emplace_back();
+      auto& run = level_runs.back();
+      run.sorted_run_id = run_id;
+      DoGenerateLevelFilesBrief(&run.files, runs_by_id[run_id], &arena_);
+    }
+  }
+}
+
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
@@ -3432,6 +3648,7 @@ void VersionStorageInfo::PrepareForVersionAppend(
   UpdateFilesByCompactionPri(immutable_options, mutable_cf_options);
   GenerateFileIndexer();
   GenerateLevelFilesBrief();
+  GenerateLevelSortedRunsBrief();
   GenerateLevel0NonOverlapping();
   GenerateBottommostFiles();
   GenerateFileLocationIndex();
@@ -4490,7 +4707,8 @@ void VersionStorageInfo::UpdateFilesByCompactionPri(
     const ImmutableOptions& ioptions, const MutableCFOptions& options) {
   if (compaction_style_ == kCompactionStyleNone ||
       compaction_style_ == kCompactionStyleFIFO ||
-      compaction_style_ == kCompactionStyleUniversal) {
+      compaction_style_ == kCompactionStyleUniversal ||
+      compaction_style_ == kCompactionStyleTiered) {
     // don't need this
     return;
   }
@@ -4744,6 +4962,17 @@ bool VersionStorageInfo::OverlapInLevel(int level,
     // empty level, no overlap
     return false;
   }
+  if (IsTiered() && level > 0) {
+    const auto& level_runs = LevelSortedRuns(level);
+    for (const auto& run : level_runs.runs) {
+      if (SomeFileOverlapsRange(*internal_comparator_, /*disjoint=*/true,
+                                run.files, smallest_user_key,
+                                largest_user_key)) {
+        return true;
+      }
+    }
+    return false;
+  }
   return SomeFileOverlapsRange(*internal_comparator_, (level > 0),
                                level_files_brief_[level], smallest_user_key,
                                largest_user_key);
@@ -4768,6 +4997,58 @@ void VersionStorageInfo::GetOverlappingInputs(
     *file_index = -1;
   }
   const Comparator* user_cmp = user_comparator_;
+  if (IsTiered() && level > 0) {
+    if (next_smallest) {
+      *next_smallest = nullptr;
+    }
+
+    Slice user_begin, user_end;
+    if (begin != nullptr) {
+      user_begin = begin->user_key();
+    }
+    if (end != nullptr) {
+      user_end = end->user_key();
+    }
+
+    for (const auto& run : LevelSortedRuns(level).runs) {
+      std::vector<FileMetaData*> run_inputs;
+      const ROCKSDB_NAMESPACE::LevelFilesBrief& run_files = run.files;
+      if (run_files.num_files == 0) {
+        continue;
+      }
+
+      int start_index = 0;
+      if (begin != nullptr) {
+        start_index = FindFile(*internal_comparator_, run_files,
+                               begin->Encode());
+        if (start_index == static_cast<int>(run_files.num_files)) {
+          continue;
+        }
+      }
+
+      for (size_t i = static_cast<size_t>(start_index); i < run_files.num_files;
+           ++i) {
+        FdWithKeyRange* file = &run_files.files[i];
+        if (begin != nullptr &&
+            user_cmp->CompareWithoutTimestamp(
+                ExtractUserKey(file->largest_key), user_begin) < 0) {
+          continue;
+        }
+        if (end != nullptr &&
+            user_cmp->CompareWithoutTimestamp(
+                ExtractUserKey(file->smallest_key), user_end) > 0) {
+          break;
+        }
+        run_inputs.push_back(file->file_metadata);
+      }
+
+      inputs->insert(inputs->end(), run_inputs.begin(), run_inputs.end());
+      if (!run_inputs.empty() && file_index != nullptr && *file_index == -1) {
+        *file_index = static_cast<int>(inputs->size() - run_inputs.size());
+      }
+    }
+    return;
+  }
   if (level > 0) {
     GetOverlappingInputsRangeBinarySearch(level, begin, end, inputs, hint_index,
                                           file_index, false, next_smallest);
@@ -5340,6 +5621,12 @@ uint64_t VersionStorageInfo::EstimateLiveDataSize() const {
 bool VersionStorageInfo::RangeMightExistAfterSortedRun(
     const Slice& smallest_user_key, const Slice& largest_user_key,
     int last_level, int last_l0_idx) {
+  if (IsTiered()) {
+    // Tiered levels may have overlapping runs in the same level, so the
+    // leveled "sorted run after this file" reasoning does not apply.
+    // Be conservative until tiered compaction/bottommost logic is added.
+    return true;
+  }
   assert((last_l0_idx != -1) == (last_level == 0));
   // TODO(ajkr): this preserves earlier behavior where we considered an L0 file
   // bottommost only if it's the oldest L0 file and there are no files on older
@@ -5608,6 +5895,7 @@ VersionSet::VersionSet(
       db_id_(db_id),
       db_options_(_db_options),
       next_file_number_(2),
+      next_sorted_run_id_(1),
       manifest_file_number_(0),  // Filled by Recover()
       options_file_number_(0),
       options_file_size_(0),
@@ -5812,6 +6100,7 @@ void VersionSet::Reset() {
   }
   db_id_.clear();
   next_file_number_.store(2);
+  next_sorted_run_id_.store(1);
   min_log_number_to_keep_.store(0);
   manifest_file_number_ = 0;
   options_file_number_ = 0;
@@ -6733,6 +7022,19 @@ Status VersionSet::Recover(
       handler.GetDbId(db_id);
     }
     if (s.ok()) {
+      uint64_t max_sorted_run_id = 0;
+      for (auto cfd : *column_family_set_) {
+        if (cfd->IsDropped()) {
+          continue;
+        }
+        const auto* vstorage = cfd->current()->storage_info();
+        for (int level = 0; level < vstorage->num_levels(); ++level) {
+          for (const auto* file : vstorage->LevelFiles(level)) {
+            max_sorted_run_id = std::max(max_sorted_run_id, file->sorted_run_id);
+          }
+        }
+      }
+      next_sorted_run_id_.store(max_sorted_run_id + 1);
       RecoverEpochNumbers();
     }
     if (log_status) {
@@ -7337,7 +7639,7 @@ Status VersionSet::WriteCurrentStateToManifest(
                        f->file_checksum_func_name, f->unique_id,
                        f->compensated_range_deletion_size, f->tail_size,
                        f->user_defined_timestamps_persisted, f->min_timestamp,
-                       f->max_timestamp);
+                       f->max_timestamp, f->sorted_run_id);
         }
       }
 
@@ -7420,6 +7722,23 @@ uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
                                 : std::min(end_level, num_non_empty_levels);
   if (end_level <= start_level) {
     return 0;
+  }
+
+  if (vstorage->IsTiered()) {
+    uint64_t total_size = 0;
+    for (int level = start_level; level < end_level; ++level) {
+      for (const auto* file_meta : vstorage->LevelFiles(level)) {
+        if (file_meta == nullptr) {
+          continue;
+        }
+        const FdWithKeyRange file(
+            file_meta->fd, file_meta->smallest.Encode(), file_meta->largest.Encode(),
+            const_cast<FileMetaData*>(file_meta));
+        total_size += ApproximateSize(read_options, v, file, start, end,
+                                      caller);
+      }
+    }
+    return total_size;
   }
 
   // Outline of the optimization that uses options.files_size_error_margin.

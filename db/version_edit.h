@@ -112,6 +112,7 @@ enum NewFileCustomTag : uint32_t {
   kCompensatedRangeDeletionSize = 14,
   kTailSize = 15,
   kUserDefinedTimestampsPersisted = 16,
+  kSortedRunId = 17,
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -298,6 +299,10 @@ struct FileMetaData {
   // Unix time when the SST file is created.
   uint64_t file_creation_time = kUnknownFileCreationTime;
 
+  // Tiered compaction-specific sorted run identifier.
+  // 0 means the file follows legacy single-run-per-level semantics.
+  uint64_t sorted_run_id = 0;
+
   // The order of a file being flushed or ingested/imported.
   // Compaction output file will be assigned with the minimum `epoch_number`
   // among input files'.
@@ -344,7 +349,8 @@ struct FileMetaData {
                const uint64_t _compensated_range_deletion_size,
                uint64_t _tail_size, bool _user_defined_timestamps_persisted,
                const std::string& _min_timestamp,
-               const std::string& _max_timestamp)
+               const std::string& _max_timestamp,
+               uint64_t _sorted_run_id = 0)
       : fd(file, file_path_id, file_size, smallest_seq, largest_seq),
         smallest(smallest_key),
         largest(largest_key),
@@ -354,6 +360,7 @@ struct FileMetaData {
         oldest_blob_file_number(oldest_blob_file),
         oldest_ancester_time(_oldest_ancester_time),
         file_creation_time(_file_creation_time),
+        sorted_run_id(_sorted_run_id),
         epoch_number(_epoch_number),
         file_checksum(_file_checksum),
         file_checksum_func_name(_file_checksum_func_name),
@@ -799,7 +806,8 @@ class VersionEdit {
                const uint64_t compensated_range_deletion_size,
                uint64_t tail_size, bool user_defined_timestamps_persisted,
                const std::string& min_timestamp = "",
-               const std::string& max_timestamp = "") {
+               const std::string& max_timestamp = "",
+               uint64_t sorted_run_id = 0) {
     assert(smallest_seqno <= largest_seqno);
     new_files_.emplace_back(
         level,
@@ -809,7 +817,8 @@ class VersionEdit {
             oldest_blob_file_number, oldest_ancester_time, file_creation_time,
             epoch_number, file_checksum, file_checksum_func_name, unique_id,
             compensated_range_deletion_size, tail_size,
-            user_defined_timestamps_persisted, min_timestamp, max_timestamp));
+            user_defined_timestamps_persisted, min_timestamp, max_timestamp,
+            sorted_run_id));
     files_to_quarantine_.push_back(file);
     if (!HasLastSequence() || largest_seqno > GetLastSequence()) {
       SetLastSequence(largest_seqno);

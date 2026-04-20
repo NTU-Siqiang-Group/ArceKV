@@ -344,6 +344,12 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     PutVarint64(&varint_tail_size, f.tail_size);
     PutLengthPrefixedSlice(dst, Slice(varint_tail_size));
   }
+  if (f.sorted_run_id != 0) {
+    PutVarint32(dst, NewFileCustomTag::kSortedRunId);
+    std::string varint_sorted_run_id;
+    PutVarint64(&varint_sorted_run_id, f.sorted_run_id);
+    PutLengthPrefixedSlice(dst, Slice(varint_sorted_run_id));
+  }
   if (!f.user_defined_timestamps_persisted) {
     // The default value for the flag is true, it's only explicitly persisted
     // when it's false. We are putting 0 as the value here to signal false
@@ -492,6 +498,11 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
         case kTailSize:
           if (!GetVarint64(&field, &f.tail_size)) {
             return "invalid tail start offset";
+          }
+          break;
+        case kSortedRunId:
+          if (!GetVarint64(&field, &f.sorted_run_id)) {
+            return "invalid sorted run id";
           }
           break;
         case kUserDefinedTimestampsPersisted:
@@ -974,6 +985,8 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     AppendNumberTo(&r, f.oldest_ancester_time);
     r.append(" file_creation_time:");
     AppendNumberTo(&r, f.file_creation_time);
+    r.append(" sorted_run_id:");
+    AppendNumberTo(&r, f.sorted_run_id);
     r.append(" epoch_number:");
     AppendNumberTo(&r, f.epoch_number);
     r.append(" file_checksum:");

@@ -592,8 +592,8 @@ class VersionBuilder::Rep {
       // Check L1 and up
 
       for (int level = 1; level < num_levels_; ++level) {
-        auto checker = [this, level, icmp](const FileMetaData* lhs,
-                                           const FileMetaData* rhs) {
+        auto checker = [this, level, icmp, vstorage](const FileMetaData* lhs,
+                                                     const FileMetaData* rhs) {
           assert(lhs);
           assert(rhs);
 
@@ -605,8 +605,10 @@ class VersionBuilder::Rep {
             return Status::Corruption("VersionBuilder", oss.str());
           }
 
-          // Make sure there is no overlap in level
-          if (icmp->Compare(lhs->largest, rhs->smallest) >= 0) {
+          // Tiered levels may contain overlapping sorted runs, while leveled
+          // styles still require each level to be globally non-overlapping.
+          if (!vstorage->IsTiered() &&
+              icmp->Compare(lhs->largest, rhs->smallest) >= 0) {
             std::ostringstream oss;
             oss << 'L' << level << " has overlapping ranges: file #"
                 << lhs->fd.GetNumber()

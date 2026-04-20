@@ -119,6 +119,17 @@ bool SomeFileOverlapsRange(const InternalKeyComparator& icmp,
 void DoGenerateLevelFilesBrief(LevelFilesBrief* file_level,
                                const std::vector<FileMetaData*>& files,
                                Arena* arena);
+
+struct SortedRunBrief {
+  uint64_t sorted_run_id = 0;
+  LevelFilesBrief files;
+};
+
+struct LevelSortedRunsBrief {
+  std::vector<SortedRunBrief> runs;
+
+  size_t num_runs() const { return runs.size(); }
+};
 enum EpochNumberRequirement {
   kMightMissing,
   kMustPresent,
@@ -481,6 +492,17 @@ class VersionStorageInfo {
     return level_files_brief_[level];
   }
 
+  bool IsTiered() const { return compaction_style_ == kCompactionStyleTiered; }
+
+  const LevelSortedRunsBrief& LevelSortedRuns(int level) const {
+    assert(level < static_cast<int>(level_sorted_runs_brief_.size()));
+    return level_sorted_runs_brief_[level];
+  }
+
+  size_t NumSortedRuns(int level) const {
+    return LevelSortedRuns(level).num_runs();
+  }
+
   // REQUIRES: PrepareForVersionAppend has been called
   const std::vector<int>& FilesByCompactionPri(int level) const {
     assert(finalized_);
@@ -684,6 +706,7 @@ class VersionStorageInfo {
   }
 
   void GenerateLevelFilesBrief();
+  void GenerateLevelSortedRunsBrief();
   void GenerateLevel0NonOverlapping();
   void GenerateBottommostFiles();
   void GenerateFileLocationIndex();
@@ -698,6 +721,7 @@ class VersionStorageInfo {
 
   // A short brief metadata of files per level
   autovector<ROCKSDB_NAMESPACE::LevelFilesBrief> level_files_brief_;
+  autovector<LevelSortedRunsBrief> level_sorted_runs_brief_;
   FileIndexer file_indexer_;
   Arena arena_;  // Used to allocate space for file_levels_
 
@@ -1123,6 +1147,17 @@ class Version {
   // that it eventually expires from the cache.
   bool IsFilterSkipped(int level, bool is_file_last_in_level = false);
 
+  void AddTieredIteratorsForLevel(const ReadOptions& read_options,
+                                  const FileOptions& soptions,
+                                  MergeIteratorBuilder* merge_iter_builder,
+                                  int level, bool allow_unprepared_value);
+
+  void AddTieredRunIterator(const ReadOptions& read_options,
+                            const FileOptions& soptions,
+                            MergeIteratorBuilder* merge_iter_builder, int level,
+                            const LevelFilesBrief& run_files,
+                            bool allow_unprepared_value);
+
   // The helper function of UpdateAccumulatedStats, which may fill the missing
   // fields of file_meta from its associated TableProperties.
   // Returns true if it does initialize FileMetaData.
@@ -1401,6 +1436,9 @@ class VersionSet {
   }
 
   uint64_t current_next_file_number() const { return next_file_number_.load(); }
+  uint64_t current_next_sorted_run_id() const {
+    return next_sorted_run_id_.load();
+  }
 
   uint64_t min_log_number_to_keep() const {
     return min_log_number_to_keep_.load();
@@ -1410,6 +1448,9 @@ class VersionSet {
 
   // Allocate and return a new file number
   uint64_t NewFileNumber() { return next_file_number_.fetch_add(1); }
+
+  // Allocate and return a new sorted run identifier.
+  uint64_t NewSortedRunId() { return next_sorted_run_id_.fetch_add(1); }
 
   // Fetch And Add n new file number
   uint64_t FetchAddFileNumber(uint64_t n) {
@@ -1746,6 +1787,7 @@ class VersionSet {
   std::string db_id_;
   const ImmutableDBOptions* const db_options_;
   std::atomic<uint64_t> next_file_number_;
+  std::atomic<uint64_t> next_sorted_run_id_;
   // Any WAL number smaller than this should be ignored during recovery,
   // and is qualified for being deleted.
   std::atomic<uint64_t> min_log_number_to_keep_ = {0};

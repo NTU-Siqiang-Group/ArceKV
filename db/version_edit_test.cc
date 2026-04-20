@@ -130,6 +130,31 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
   ASSERT_FALSE(parsed.GetPersistUserDefinedTimestamps());
 }
 
+TEST_F(VersionEditTest, EncodeDecodeNewFile4SortedRunId) {
+  static const uint64_t kBig = 1ull << 50;
+
+  VersionEdit edit;
+  edit.AddFile(3, 300, 0, 100, InternalKey("foo", kBig + 500, kTypeValue),
+               InternalKey("zoo", kBig + 600, kTypeDeletion), kBig + 500,
+               kBig + 600, false, Temperature::kUnknown,
+               kInvalidBlobFileNumber, kUnknownOldestAncesterTime,
+               kUnknownFileCreationTime, 300 /* epoch_number */,
+               kUnknownFileChecksum, kUnknownFileChecksumFuncName,
+               kNullUniqueId64x2, 0, 0, true, "", "",
+               /*sorted_run_id=*/42);
+  edit.SetComparatorName("foo");
+  edit.SetPersistUserDefinedTimestamps(true);
+
+  std::string encoded;
+  edit.EncodeTo(&encoded, 0 /* ts_sz */);
+
+  VersionEdit parsed;
+  Status s = parsed.DecodeFrom(encoded);
+  ASSERT_OK(s);
+  ASSERT_EQ(1U, parsed.GetNewFiles().size());
+  ASSERT_EQ(42U, parsed.GetNewFiles()[0].second.sorted_run_id);
+}
+
 TEST_F(VersionEditTest, EncodeDecodeNewFile4HandleFileBoundary) {
   static const uint64_t kBig = 1ull << 50;
   size_t ts_sz = 16;

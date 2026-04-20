@@ -126,14 +126,16 @@ class VersionStorageInfoTestBase : public testing::Test {
     return InternalKey(ukey, smallest_seq, kTypeValue);
   }
 
-  explicit VersionStorageInfoTestBase(const Comparator* ucmp)
+  explicit VersionStorageInfoTestBase(
+      const Comparator* ucmp,
+      CompactionStyle compaction_style = kCompactionStyleLevel)
       : ucmp_(ucmp),
         icmp_(ucmp_),
         logger_(new CountingLogger()),
         options_(GetOptionsWithNumLevels(6, logger_)),
         ioptions_(options_),
         mutable_cf_options_(options_),
-        vstorage_(&icmp_, ucmp_, 6, kCompactionStyleLevel,
+        vstorage_(&icmp_, ucmp_, 6, compaction_style,
                   /*src_vstorage=*/nullptr,
                   /*_force_consistency_checks=*/false,
                   EpochNumberRequirement::kMustPresent, ioptions_.clock,
@@ -153,18 +155,20 @@ class VersionStorageInfoTestBase : public testing::Test {
   void Add(int level, uint32_t file_number, const char* smallest,
            const char* largest, uint64_t file_size = 0,
            uint64_t oldest_blob_file_number = kInvalidBlobFileNumber,
-           uint64_t compensated_range_deletion_size = 0) {
+           uint64_t compensated_range_deletion_size = 0,
+           uint64_t sorted_run_id = 0) {
     constexpr SequenceNumber dummy_seq = 0;
 
     Add(level, file_number, GetInternalKey(smallest, dummy_seq),
         GetInternalKey(largest, dummy_seq), file_size, oldest_blob_file_number,
-        compensated_range_deletion_size);
+        compensated_range_deletion_size, sorted_run_id);
   }
 
   void Add(int level, uint32_t file_number, const InternalKey& smallest,
            const InternalKey& largest, uint64_t file_size = 0,
            uint64_t oldest_blob_file_number = kInvalidBlobFileNumber,
-           uint64_t compensated_range_deletion_size = 0) {
+           uint64_t compensated_range_deletion_size = 0,
+           uint64_t sorted_run_id = 0) {
     assert(level < vstorage_.num_levels());
     FileMetaData* f = new FileMetaData(
         file_number, 0, file_size, smallest, largest, /* smallest_seq */ 0,
@@ -174,7 +178,7 @@ class VersionStorageInfoTestBase : public testing::Test {
         kUnknownEpochNumber, kUnknownFileChecksum, kUnknownFileChecksumFuncName,
         kNullUniqueId64x2, compensated_range_deletion_size, 0,
         /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
-        /* max timestamp */ "");
+        /* max timestamp */ "", sorted_run_id);
     vstorage_.AddFile(level, f);
   }
 
@@ -221,6 +225,13 @@ class VersionStorageInfoTest : public VersionStorageInfoTestBase {
   ~VersionStorageInfoTest() override = default;
 };
 
+class TieredVersionStorageInfoTest : public VersionStorageInfoTestBase {
+ public:
+  TieredVersionStorageInfoTest()
+      : VersionStorageInfoTestBase(BytewiseComparator(),
+                                   kCompactionStyleTiered) {}
+};
+
 TEST_F(VersionStorageInfoTest, MaxBytesForLevelStatic) {
   ioptions_.level_compaction_dynamic_level_bytes = false;
   mutable_cf_options_.max_bytes_for_level_base = 10;
@@ -237,6 +248,99 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelStatic) {
   ASSERT_EQ(vstorage_.MaxBytesForLevel(4), 1250U);
 
   ASSERT_EQ(0, logger_->log_count);
+}
+
+TEST_F(TieredVersionStorageInfoTest, SortedRunsGroupedByRunId) {
+  Add(1, 11U, "100", "199", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(1, 21U, "120", "179", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/20);
+  Add(1, 12U, "200", "299", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(1, 22U, "300", "399", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/20);
+
+  UpdateVersionStorageInfo();
+
+  ASSERT_TRUE(vstorage_.IsTiered());
+  ASSERT_EQ(2U, vstorage_.NumSortedRuns(1));
+
+  const auto& level_runs = vstorage_.LevelSortedRuns(1);
+  ASSERT_EQ(2U, level_runs.num_runs());
+
+  ASSERT_EQ(20U, level_runs.runs[0].sorted_run_id);
+  ASSERT_EQ(2U, level_runs.runs[0].files.num_files);
+  ASSERT_EQ(21U, level_runs.runs[0].files.files[0].fd.GetNumber());
+  ASSERT_EQ(22U, level_runs.runs[0].files.files[1].fd.GetNumber());
+
+  ASSERT_EQ(10U, level_runs.runs[1].sorted_run_id);
+  ASSERT_EQ(2U, level_runs.runs[1].files.num_files);
+  ASSERT_EQ(11U, level_runs.runs[1].files.files[0].fd.GetNumber());
+  ASSERT_EQ(12U, level_runs.runs[1].files.files[1].fd.GetNumber());
+}
+
+TEST_F(TieredVersionStorageInfoTest, SortedRunsSortFilesWithinEachRun) {
+  Add(1, 12U, "200", "299", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(1, 11U, "100", "199", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(1, 22U, "300", "399", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/20);
+  Add(1, 21U, "050", "099", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/20);
+
+  UpdateVersionStorageInfo();
+
+  const auto& level_runs = vstorage_.LevelSortedRuns(1);
+  ASSERT_EQ(2U, level_runs.num_runs());
+
+  ASSERT_EQ(20U, level_runs.runs[0].sorted_run_id);
+  ASSERT_EQ(21U, level_runs.runs[0].files.files[0].fd.GetNumber());
+  ASSERT_EQ(22U, level_runs.runs[0].files.files[1].fd.GetNumber());
+
+  ASSERT_EQ(10U, level_runs.runs[1].sorted_run_id);
+  ASSERT_EQ(11U, level_runs.runs[1].files.files[0].fd.GetNumber());
+  ASSERT_EQ(12U, level_runs.runs[1].files.files[1].fd.GetNumber());
+}
+
+TEST_F(TieredVersionStorageInfoTest, OverlapAndOverlappingInputsSearchEachRun) {
+  Add(1, 11U, "100", "199", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(1, 12U, "200", "299", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(1, 21U, "150", "249", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/20);
+  Add(1, 22U, "300", "399", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/20);
+
+  UpdateVersionStorageInfo();
+
+  const Slice begin("180");
+  const Slice end("220");
+  ASSERT_TRUE(vstorage_.OverlapInLevel(1, &begin, &end));
+
+  InternalKey ibegin = GetInternalKey("180");
+  InternalKey iend = GetInternalKey("220");
+  std::vector<FileMetaData*> inputs;
+  vstorage_.GetOverlappingInputs(1, &ibegin, &iend, &inputs);
+
+  ASSERT_EQ(3U, inputs.size());
+  ASSERT_EQ(21U, inputs[0]->fd.GetNumber());
+  ASSERT_EQ(11U, inputs[1]->fd.GetNumber());
+  ASSERT_EQ(12U, inputs[2]->fd.GetNumber());
+}
+
+TEST_F(TieredVersionStorageInfoTest,
+       RangeMightExistAfterSortedRunIsConservative) {
+  Add(1, 11U, "100", "199", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(2, 21U, "100", "199", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/20);
+
+  UpdateVersionStorageInfo();
+
+  ASSERT_TRUE(vstorage_.RangeMightExistAfterSortedRun(
+      Slice("100"), Slice("199"), /*last_level=*/1, /*last_l0_idx=*/-1));
 }
 
 TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_1) {
@@ -1508,6 +1612,133 @@ class VersionSetTest : public VersionSetTestBase, public testing::Test {
   VersionSetTest() : VersionSetTestBase("version_set_test") {}
 };
 
+class TieredVersionReadTest : public VersionSetTest {
+ public:
+  struct MockEntry {
+    std::string user_key;
+    SequenceNumber seq;
+    std::string value;
+    ValueType type = kTypeValue;
+  };
+
+  struct MockFileSpec {
+    uint64_t file_number;
+    int level;
+    uint64_t sorted_run_id;
+    std::vector<MockEntry> entries;
+  };
+
+  void EnableTieredReads() {
+    cf_options_.compaction_style = kCompactionStyleTiered;
+  }
+
+  FileMetaData CreateMockFile(const MockFileSpec& spec) {
+    EXPECT_FALSE(spec.entries.empty());
+
+    std::vector<std::pair<InternalKey, std::string>> internal_entries;
+    internal_entries.reserve(spec.entries.size());
+    for (const auto& entry : spec.entries) {
+      internal_entries.emplace_back(
+          InternalKey(entry.user_key, entry.seq, entry.type), entry.value);
+    }
+
+    InternalKeyComparator icmp(options_.comparator);
+    std::sort(internal_entries.begin(), internal_entries.end(),
+              [&icmp](const auto& lhs, const auto& rhs) {
+                return icmp.Compare(lhs.first.Encode(), rhs.first.Encode()) < 0;
+              });
+
+    mock::KVVector table_contents;
+    table_contents.reserve(internal_entries.size());
+    for (const auto& entry : internal_entries) {
+      table_contents.emplace_back(entry.first.Encode().ToString(),
+                                  entry.second);
+    }
+
+    std::string fname = MakeTableFileName(dbname_, spec.file_number);
+    Status status =
+        static_cast_with_check<mock::MockTableFactory>(table_factory_.get())
+            ->CreateMockTable(env_, fname, std::move(table_contents));
+    EXPECT_OK(status);
+
+    uint64_t file_size = 0;
+    status = fs_->GetFileSize(fname, IOOptions(), &file_size, nullptr);
+    EXPECT_OK(status);
+    EXPECT_GT(file_size, 0U);
+
+    return FileMetaData(
+        spec.file_number, /*file_path_id=*/0, file_size,
+        internal_entries.front().first, internal_entries.back().first,
+        /*smallest_seqno=*/0, /*largest_seqno=*/0,
+        /*marked_for_compact=*/false, Temperature::kUnknown,
+        kInvalidBlobFileNumber, kUnknownOldestAncesterTime,
+        kUnknownFileCreationTime, /*epoch_number=*/1, kUnknownFileChecksum,
+        kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
+        /*user_defined_timestamps_persisted=*/true,
+        /*min timestamp=*/"", /*max timestamp=*/"", spec.sorted_run_id);
+  }
+
+  void InstallMockFiles(const std::vector<MockFileSpec>& files) {
+    VersionEdit edit;
+    for (const auto& file : files) {
+      edit.AddFile(file.level, CreateMockFile(file));
+    }
+    ASSERT_OK(LogAndApplyToDefaultCF(edit));
+  }
+
+  std::string GetFromCurrentVersion(const std::string& user_key) {
+    ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetDefault();
+    EXPECT_NE(nullptr, cfd);
+    Version* version = cfd->current();
+    EXPECT_NE(nullptr, version);
+
+    LookupKey lkey(user_key, kMaxSequenceNumber);
+    PinnableSlice value;
+    Status status;
+    MergeContext merge_context;
+    SequenceNumber max_covering_tombstone_seq = 0;
+    PinnedIteratorsManager pinned_iters_mgr;
+    version->Get(ReadOptions(), lkey, &value, /*columns=*/nullptr,
+                 /*timestamp=*/nullptr, &status, &merge_context,
+                 &max_covering_tombstone_seq, &pinned_iters_mgr);
+    EXPECT_OK(status);
+    return value.ToString();
+  }
+
+  std::vector<std::pair<std::string, std::string>> ScanCurrentVersion() {
+    ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetDefault();
+    EXPECT_NE(nullptr, cfd);
+    Version* version = cfd->current();
+    EXPECT_NE(nullptr, version);
+
+    ReadOptions read_options;
+    Arena arena;
+    MergeIteratorBuilder merge_iter_builder(&cfd->internal_comparator(), &arena,
+                                            false /* prefix_seek_mode */);
+    version->AddIterators(read_options, FileOptions(), &merge_iter_builder,
+                          /*allow_unprepared_value=*/true);
+    InternalIterator* internal_iter = merge_iter_builder.Finish();
+
+    std::vector<std::pair<std::string, std::string>> result;
+    ParsedInternalKey parsed;
+    std::string last_user_key;
+    for (internal_iter->SeekToFirst(); internal_iter->Valid();
+         internal_iter->Next()) {
+      Status status =
+          ParseInternalKey(internal_iter->key(), &parsed, /*log_err_key=*/true);
+      EXPECT_OK(status);
+      EXPECT_EQ(kTypeValue, parsed.type);
+      if (!result.empty() && parsed.user_key.ToString() == last_user_key) {
+        continue;
+      }
+      last_user_key = parsed.user_key.ToString();
+      result.emplace_back(last_user_key, internal_iter->value().ToString());
+    }
+    EXPECT_OK(internal_iter->status());
+    return result;
+  }
+};
+
 TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   NewDB();
   const int kGroupSize = 5;
@@ -1543,6 +1774,170 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   mutex_.Unlock();
   EXPECT_OK(s);
   EXPECT_EQ(kGroupSize - 1, count);
+}
+
+TEST_F(VersionSetTest, RecoverSortedRunIdFromManifest) {
+  NewDB();
+
+  std::vector<FileMetaData> file_metas;
+  CreateDummyTableFiles(
+      {SstInfo(100, kDefaultColumnFamilyName, "key0",
+               static_cast<uint64_t>(1))},
+      &file_metas);
+  ASSERT_EQ(1U, file_metas.size());
+
+  file_metas[0].sorted_run_id = 7;
+
+  VersionEdit edit;
+  edit.AddFile(1 /* level */, file_metas[0]);
+  ASSERT_OK(LogAndApplyToDefaultCF(edit));
+
+  ReopenDB();
+
+  auto* cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(nullptr, cfd);
+  const auto* vstorage = cfd->current()->storage_info();
+  ASSERT_EQ(1U, vstorage->LevelFiles(1).size());
+  ASSERT_EQ(7U, vstorage->LevelFiles(1)[0]->sorted_run_id);
+  ASSERT_EQ(8U, versions_->current_next_sorted_run_id());
+}
+
+TEST_F(TieredVersionReadTest, GetReturnsLatestValueAcrossOverlappingRuns) {
+  EnableTieredReads();
+  NewDB();
+
+  InstallMockFiles({
+      MockFileSpec{100, 1, 10, {{"a", 20, "a-l1-run10"},
+                                {"b", 20, "b-l1-run10"}}},
+      MockFileSpec{101, 1, 10, {{"c", 20, "c-l1-run10"},
+                                {"d", 20, "d-l1-run10"}}},
+      MockFileSpec{102, 1, 10, {{"k", 20, "k-l1-run10"},
+                                {"l", 20, "l-l1-run10"}}},
+      MockFileSpec{103, 1, 10, {{"m", 20, "m-l1-run10"},
+                                {"n", 20, "n-l1-run10"}}},
+      MockFileSpec{104, 1, 10, {{"y", 20, "y-l1-run10"},
+                                {"z", 20, "z-l1-run10"}}},
+      MockFileSpec{105, 1, 20, {{"b", 30, "b-l1-run20"},
+                                {"f", 30, "f-l1-run20"}}},
+      MockFileSpec{106, 1, 20, {{"g", 30, "g-l1-run20"},
+                                {"h", 30, "h-l1-run20"}}},
+      MockFileSpec{107, 1, 20, {{"k", 30, "k-l1-run20"},
+                                {"p", 30, "p-l1-run20"}}},
+      MockFileSpec{108, 1, 20, {{"q", 30, "q-l1-run20"},
+                                {"r", 30, "r-l1-run20"}}},
+      MockFileSpec{109, 1, 20, {{"y", 30, "y-l1-run20"},
+                                {"zz", 30, "zz-l1-run20"}}},
+      MockFileSpec{110, 2, 5, {{"k", 10, "k-l2-run5"},
+                               {"n", 10, "n-l2-run5"}}},
+  });
+
+  ASSERT_EQ("k-l1-run20", GetFromCurrentVersion("k"));
+  ASSERT_EQ("a-l1-run10", GetFromCurrentVersion("a"));
+  ASSERT_EQ("y-l1-run20", GetFromCurrentVersion("y"));
+  ASSERT_EQ("n-l1-run10", GetFromCurrentVersion("n"));
+}
+
+TEST_F(TieredVersionReadTest, IteratorMergesSortedRunsInKeyOrder) {
+  EnableTieredReads();
+  NewDB();
+
+  InstallMockFiles({
+      MockFileSpec{110, 1, 10, {{"a", 20, "a-old"},
+                                {"b", 20, "b-only"},
+                                {"d", 20, "d-old"}}},
+      MockFileSpec{111, 1, 20, {{"a", 30, "a-new"},
+                                {"c", 30, "c-only"},
+                                {"d", 30, "d-new"}}},
+      MockFileSpec{112, 2, 5, {{"a", 10, "a-oldest"},
+                               {"e", 10, "e-only"}}},
+  });
+
+  std::vector<std::pair<std::string, std::string>> expected = {
+      {"a", "a-new"},
+      {"b", "b-only"},
+      {"c", "c-only"},
+      {"d", "d-new"},
+      {"e", "e-only"},
+  };
+  ASSERT_EQ(expected, ScanCurrentVersion());
+}
+
+TEST_F(TieredVersionReadTest, IteratorHandlesMultipleFilesPerRun) {
+  EnableTieredReads();
+  NewDB();
+
+  InstallMockFiles({
+      MockFileSpec{130, 1, 10, {{"a1", 20, "run10-a1"},
+                                {"a2", 20, "run10-a2"}}},
+      MockFileSpec{131, 1, 10, {{"a3", 20, "run10-a3"},
+                                {"a4", 20, "run10-a4"}}},
+      MockFileSpec{132, 1, 10, {{"a5", 20, "run10-a5"},
+                                {"m", 20, "run10-m"}}},
+      MockFileSpec{133, 1, 10, {{"n", 20, "run10-n"},
+                                {"o", 20, "run10-o"}}},
+      MockFileSpec{134, 1, 10, {{"p", 20, "run10-p"},
+                                {"z", 20, "run10-z"}}},
+      MockFileSpec{135, 1, 20, {{"a3", 30, "run20-a3"},
+                                {"b1", 30, "run20-b1"}}},
+      MockFileSpec{136, 1, 20, {{"b2", 30, "run20-b2"},
+                                {"m", 30, "run20-m"}}},
+      MockFileSpec{137, 1, 20, {{"q", 30, "run20-q"},
+                                {"r", 30, "run20-r"}}},
+      MockFileSpec{138, 1, 20, {{"s", 30, "run20-s"},
+                                {"t", 30, "run20-t"}}},
+      MockFileSpec{139, 1, 20, {{"u", 30, "run20-u"},
+                                {"v", 30, "run20-v"}}},
+      MockFileSpec{140, 2, 5, {{"zz1", 10, "run5-zz1"},
+                               {"zz2", 10, "run5-zz2"}}},
+  });
+
+  std::vector<std::pair<std::string, std::string>> expected = {
+      {"a1", "run10-a1"}, {"a2", "run10-a2"}, {"a3", "run20-a3"},
+      {"a4", "run10-a4"}, {"a5", "run10-a5"}, {"b1", "run20-b1"},
+      {"b2", "run20-b2"}, {"m", "run20-m"},   {"n", "run10-n"},
+      {"o", "run10-o"},   {"p", "run10-p"},   {"q", "run20-q"},
+      {"r", "run20-r"},   {"s", "run20-s"},   {"t", "run20-t"},
+      {"u", "run20-u"},   {"v", "run20-v"},   {"z", "run10-z"},
+      {"zz1", "run5-zz1"}, {"zz2", "run5-zz2"},
+  };
+  ASSERT_EQ(expected, ScanCurrentVersion());
+
+  ASSERT_EQ("run20-a3", GetFromCurrentVersion("a3"));
+  ASSERT_EQ("run20-m", GetFromCurrentVersion("m"));
+  ASSERT_EQ("run5-zz2", GetFromCurrentVersion("zz2"));
+}
+
+TEST_F(TieredVersionReadTest, LargerMultiLevelTieredReadsRemainOrdered) {
+  EnableTieredReads();
+  NewDB();
+
+  InstallMockFiles({
+      MockFileSpec{120, 1, 10, {{"k01", 20, "l1r10-k01"},
+                                {"k03", 20, "l1r10-k03"},
+                                {"k05", 20, "l1r10-k05"}}},
+      MockFileSpec{121, 1, 20, {{"k02", 30, "l1r20-k02"},
+                                {"k03", 30, "l1r20-k03"},
+                                {"k06", 30, "l1r20-k06"}}},
+      MockFileSpec{122, 2, 5, {{"k00", 10, "l2r05-k00"},
+                               {"k03", 10, "l2r05-k03"},
+                               {"k07", 10, "l2r05-k07"}}},
+      MockFileSpec{123, 2, 6, {{"k04", 15, "l2r06-k04"},
+                               {"k06", 15, "l2r06-k06"},
+                               {"k08", 15, "l2r06-k08"}}},
+      MockFileSpec{124, 3, 1, {{"k09", 5, "l3r01-k09"}}},
+  });
+
+  ASSERT_EQ("l1r20-k03", GetFromCurrentVersion("k03"));
+  ASSERT_EQ("l1r20-k06", GetFromCurrentVersion("k06"));
+  ASSERT_EQ("l3r01-k09", GetFromCurrentVersion("k09"));
+
+  std::vector<std::pair<std::string, std::string>> expected = {
+      {"k00", "l2r05-k00"}, {"k01", "l1r10-k01"}, {"k02", "l1r20-k02"},
+      {"k03", "l1r20-k03"}, {"k04", "l2r06-k04"}, {"k05", "l1r10-k05"},
+      {"k06", "l1r20-k06"}, {"k07", "l2r05-k07"}, {"k08", "l2r06-k08"},
+      {"k09", "l3r01-k09"},
+  };
+  ASSERT_EQ(expected, ScanCurrentVersion());
 }
 
 TEST_F(VersionSetTest, PersistBlobFileStateInNewManifest) {

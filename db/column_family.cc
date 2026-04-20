@@ -208,7 +208,8 @@ Status CheckCFPathsSupported(const DBOptions& db_options,
   // in which cf_paths is not specified, which results in db_paths
   // being used.
   if ((cf_options.compaction_style != kCompactionStyleUniversal) &&
-      (cf_options.compaction_style != kCompactionStyleLevel)) {
+      (cf_options.compaction_style != kCompactionStyleLevel) &&
+      (cf_options.compaction_style != kCompactionStyleTiered)) {
     if (cf_options.cf_paths.size() > 1) {
       return Status::NotSupported(
           "More than one CF paths are only supported in "
@@ -276,7 +277,8 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
   if (result.num_levels < 1) {
     result.num_levels = 1;
   }
-  if (result.compaction_style == kCompactionStyleLevel &&
+  if ((result.compaction_style == kCompactionStyleLevel ||
+       result.compaction_style == kCompactionStyleTiered) &&
       result.num_levels < 2) {
     result.num_levels = 2;
   }
@@ -682,6 +684,15 @@ ColumnFamilyData::ColumnFamilyData(
     if (ioptions_.compaction_style == kCompactionStyleLevel) {
       compaction_picker_.reset(
           new LevelCompactionPicker(ioptions_, &internal_comparator_));
+    } else if (ioptions_.compaction_style == kCompactionStyleTiered) {
+      compaction_picker_.reset(
+          new NullCompactionPicker(ioptions_, &internal_comparator_));
+      ROCKS_LOG_WARN(
+          ioptions_.logger,
+          "Column family %s uses kCompactionStyleTiered, but its compaction "
+          "picker is not implemented yet. Background compaction is disabled "
+          "until later milestones land.\n",
+          GetName().c_str());
     } else if (ioptions_.compaction_style == kCompactionStyleUniversal) {
       compaction_picker_.reset(
           new UniversalCompactionPicker(ioptions_, &internal_comparator_));
