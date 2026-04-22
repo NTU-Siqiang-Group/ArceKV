@@ -503,6 +503,12 @@ class VersionStorageInfo {
     return LevelSortedRuns(level).num_runs();
   }
 
+  // Returns the number of sorted runs in `level` that are eligible for a
+  // whole-level tiered compaction. If any file in the level is already part of
+  // a running compaction, returns 0 so the level is skipped until it is fully
+  // available again.
+  size_t NumTieredRunsForCompaction(int level) const;
+
   // REQUIRES: PrepareForVersionAppend has been called
   const std::vector<int>& FilesByCompactionPri(int level) const {
     assert(finalized_);

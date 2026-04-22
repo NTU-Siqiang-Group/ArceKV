@@ -360,6 +360,7 @@ class TieredFilePicker {
                    const InternalKeyComparator* internal_comparator)
       : curr_level_(0),
         curr_run_(0),
+        curr_l0_file_(0),
         hit_file_level_(static_cast<unsigned int>(-1)),
         storage_info_(storage_info),
         user_key_(user_key),
@@ -370,6 +371,24 @@ class TieredFilePicker {
   FdWithKeyRange* GetNextFile() {
     while (curr_level_ <
            static_cast<unsigned int>(storage_info_->num_non_empty_levels())) {
+      if (curr_level_ == 0) {
+        const auto& l0_files = storage_info_->LevelFilesBrief(0);
+        while (curr_l0_file_ < l0_files.num_files) {
+          FdWithKeyRange* f = &l0_files.files[curr_l0_file_++];
+          if (user_comparator_->CompareWithoutTimestamp(
+                  user_key_, ExtractUserKey(f->smallest_key)) < 0 ||
+              user_comparator_->CompareWithoutTimestamp(
+                  user_key_, ExtractUserKey(f->largest_key)) > 0) {
+            continue;
+          }
+          hit_file_level_ = curr_level_;
+          return f;
+        }
+        ++curr_level_;
+        curr_run_ = 0;
+        continue;
+      }
+
       const auto& level_runs = storage_info_->LevelSortedRuns(curr_level_);
       while (curr_run_ < level_runs.num_runs()) {
         // Runs are searched from newest to oldest. This assumes
@@ -408,6 +427,7 @@ class TieredFilePicker {
  private:
   unsigned int curr_level_;
   size_t curr_run_;
+  size_t curr_l0_file_;
   unsigned int hit_file_level_;
   const VersionStorageInfo* storage_info_;
   Slice user_key_;
@@ -973,6 +993,11 @@ void DoGenerateLevelFilesBrief(LevelFilesBrief* file_level,
     f.smallest_key = Slice(mem, smallest_size);
     f.largest_key = Slice(mem + smallest_size, largest_size);
   }
+}
+
+void CleanupLevelFilesBriefArena(void* arg1, void* arg2) {
+  delete static_cast<Arena*>(arg1);
+  delete static_cast<LevelFilesBrief*>(arg2);
 }
 
 static bool AfterFile(const Comparator* ucmp, const Slice* user_key,
@@ -2540,6 +2565,36 @@ void Version::AddTieredIteratorsForLevel(const ReadOptions& read_options,
                                          MergeIteratorBuilder* merge_iter_builder,
                                          int level,
                                          bool allow_unprepared_value) {
+  if (level == 0) {
+    auto* arena = merge_iter_builder->GetArena();
+    std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;
+    for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
+      const auto& file = storage_info_.LevelFilesBrief(0).files[i];
+      auto table_iter = cfd_->table_cache()->NewIterator(
+          read_options, soptions, cfd_->internal_comparator(),
+          *file.file_metadata, /*range_del_agg=*/nullptr, mutable_cf_options_,
+          nullptr, cfd_->internal_stats()->GetFileReadHist(0),
+          TableReaderCaller::kUserIterator, arena,
+          false /* skip_filters */, level, max_file_size_for_l0_meta_pin_,
+          nullptr /* smallest_compaction_key */,
+          nullptr /* largest_compaction_key */, allow_unprepared_value,
+          nullptr /* range_del_read_seqno */, &tombstone_iter);
+      if (read_options.ignore_range_deletions) {
+        merge_iter_builder->AddIterator(table_iter);
+      } else {
+        merge_iter_builder->AddPointAndTombstoneIterator(
+            table_iter, std::move(tombstone_iter));
+      }
+    }
+
+    if (should_sample_file_read()) {
+      for (FileMetaData* meta : storage_info_.LevelFiles(level)) {
+        sample_file_read_inc(meta);
+      }
+    }
+    return;
+  }
+
   const auto& level_runs = storage_info_.LevelSortedRuns(level);
   for (const auto& run : level_runs.runs) {
     AddTieredRunIterator(read_options, soptions, merge_iter_builder, level,
@@ -3639,6 +3694,36 @@ void VersionStorageInfo::GenerateLevelSortedRunsBrief() {
   }
 }
 
+size_t VersionStorageInfo::NumTieredRunsForCompaction(int level) const {
+  assert(level >= 0);
+  assert(level < num_levels_);
+
+  if (!IsTiered()) {
+    return 0;
+  }
+
+  if (level == 0) {
+    for (const auto* file : files_[level]) {
+      if (file->being_compacted) {
+        return 0;
+      }
+    }
+    return files_[level].size();
+  }
+
+  for (const auto* file : files_[level]) {
+    if (file->being_compacted) {
+      return 0;
+    }
+  }
+
+  if (level >= static_cast<int>(level_sorted_runs_brief_.size())) {
+    return 0;
+  }
+
+  return level_sorted_runs_brief_[level].runs.size();
+}
+
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
@@ -3812,7 +3897,8 @@ void VersionStorageInfo::ComputeCompensatedSizes() {
 }
 
 int VersionStorageInfo::MaxInputLevel() const {
-  if (compaction_style_ == kCompactionStyleLevel) {
+  if (compaction_style_ == kCompactionStyleLevel ||
+      compaction_style_ == kCompactionStyleTiered) {
     return num_levels() - 2;
   }
   return 0;
@@ -3988,6 +4074,56 @@ void VersionStorageInfo::ComputeCompactionScore(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options,
     const std::string& full_history_ts_low) {
+  int max_output_level =
+      MaxOutputLevel(immutable_options.cf_allow_ingest_behind ||
+                     immutable_options.allow_ingest_behind);
+  if (IsTiered()) {
+    const double run_limit = mutable_cf_options.max_bytes_for_level_multiplier;
+    for (int level = 0; level <= MaxInputLevel(); ++level) {
+      const size_t num_runs = NumTieredRunsForCompaction(level);
+      double score = 0.0;
+      if (run_limit > 0 && static_cast<double>(num_runs) >= run_limit) {
+        score = static_cast<double>(num_runs) / run_limit;
+      }
+      compaction_level_[level] = level;
+      compaction_score_[level] = score;
+    }
+    for (int i = MaxInputLevel() + 1; i < num_levels(); ++i) {
+      compaction_level_[i] = i;
+      compaction_score_[i] = 0.0;
+    }
+
+    for (int i = 0; i < num_levels() - 2; i++) {
+      for (int j = i + 1; j < num_levels() - 1; j++) {
+        if (compaction_score_[i] < compaction_score_[j]) {
+          double score = compaction_score_[i];
+          int level = compaction_level_[i];
+          compaction_score_[i] = compaction_score_[j];
+          compaction_level_[i] = compaction_level_[j];
+          compaction_score_[j] = score;
+          compaction_level_[j] = level;
+        }
+      }
+    }
+    ComputeFilesMarkedForCompaction(max_output_level);
+    ComputeBottommostFilesMarkedForCompaction(
+        immutable_options.cf_allow_ingest_behind ||
+            immutable_options.allow_ingest_behind,
+        immutable_options.user_comparator, full_history_ts_low);
+    ComputeExpiredTtlFiles(immutable_options, mutable_cf_options.ttl);
+    ComputeFilesMarkedForPeriodicCompaction(
+        immutable_options, mutable_cf_options.periodic_compaction_seconds,
+        max_output_level);
+    ComputeFilesMarkedForForcedBlobGC(
+        mutable_cf_options.blob_garbage_collection_age_cutoff,
+        mutable_cf_options.blob_garbage_collection_force_threshold,
+        mutable_cf_options.enable_blob_garbage_collection);
+    ComputeFilesMarkedForReadTriggeredCompaction(
+        mutable_cf_options.read_triggered_compaction_threshold,
+        immutable_options.compaction_style);
+    return;
+  }
+
   double total_downcompact_bytes = 0.0;
   // Historically, score is defined as actual bytes in a level divided by
   // the level's target size, and 1.0 is the threshold for triggering
@@ -3998,9 +4134,6 @@ void VersionStorageInfo::ComputeCompactionScore(
   // maintaining it to be over 1.0, we scale the original score by 10x
   // if it is larger than 1.0.
   const double kScoreScale = 10.0;
-  int max_output_level =
-      MaxOutputLevel(immutable_options.cf_allow_ingest_behind ||
-                     immutable_options.allow_ingest_behind);
   for (int level = 0; level <= MaxInputLevel(); level++) {
     double score;
     if (level == 0) {
@@ -8031,12 +8164,20 @@ InternalIterator* VersionSet::MakeInputIterator(
     const std::optional<const Slice>& start,
     const std::optional<const Slice>& end) {
   auto cfd = c->column_family_data();
+  const bool use_tiered_run_iters =
+      cfd->ioptions().compaction_style == kCompactionStyleTiered &&
+      c->num_input_levels() == 1 && c->level() > 0;
   // Level-0 files have to be merged together.  For other levels,
   // we will make a concatenating iterator per level.
   // TODO(opt): use concatenating iterator for level-0 if there is no overlap
-  const size_t space = (c->level() == 0 ? c->input_levels(0)->num_files +
-                                              c->num_input_levels() - 1
-                                        : c->num_input_levels());
+  size_t space = 0;
+  if (use_tiered_run_iters) {
+    space = c->num_input_files(0);
+  } else {
+    space = (c->level() == 0 ? c->input_levels(0)->num_files +
+                                   c->num_input_levels() - 1
+                             : c->num_input_levels());
+  }
   InternalIterator** list = new InternalIterator*[space];
   // First item in the pair is a pointer to range tombstones.
   // Second item is a pointer to a member of a LevelIterator,
@@ -8048,6 +8189,71 @@ InternalIterator* VersionSet::MakeInputIterator(
       range_tombstones;
   size_t num = 0;
   [[maybe_unused]] size_t num_input_files = 0;
+  if (use_tiered_run_iters) {
+    const int level = c->level();
+    std::vector<FileMetaData*> run_files;
+    uint64_t current_run_id = 0;
+    bool has_current_run = false;
+    auto flush_run = [&]() {
+      if (run_files.empty()) {
+        return;
+      }
+      num_input_files += run_files.size();
+      if (run_files.size() == 1) {
+        std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;
+        auto table_iter = cfd->table_cache()->NewIterator(
+            read_options, file_options_compactions, cfd->internal_comparator(),
+            *run_files[0], range_del_agg, c->mutable_cf_options(), nullptr,
+            /* no per level latency histogram=*/nullptr,
+            TableReaderCaller::kCompaction,
+            /*arena=*/nullptr,
+            /*skip_filters=*/false, /*level=*/level,
+            MaxFileSizeForL0MetaPin(c->mutable_cf_options()),
+            /*smallest_compaction_key=*/nullptr,
+            /*largest_compaction_key=*/nullptr,
+            /*allow_unprepared_value=*/false,
+            /*range_del_read_seqno=*/nullptr, &tombstone_iter,
+            /*maybe_pin_table_handle=*/true);
+        if (read_options.ignore_range_deletions) {
+          list[num++] = table_iter;
+        } else {
+          list[num++] = table_iter;
+          range_tombstones.emplace_back(std::move(tombstone_iter), nullptr);
+        }
+        run_files.clear();
+        return;
+      }
+
+      auto* run_arena = new Arena();
+      auto* run_brief = new LevelFilesBrief();
+      DoGenerateLevelFilesBrief(run_brief, run_files, run_arena);
+      std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr =
+          nullptr;
+      list[num++] = new LevelIterator(
+          cfd->table_cache(), read_options, file_options_compactions,
+          cfd->internal_comparator(), run_brief, c->mutable_cf_options(),
+          /*no per level latency histogram=*/nullptr,
+          TableReaderCaller::kCompaction, /*skip_filters=*/false,
+          /*level=*/level, range_del_agg,
+          /*compaction_boundaries=*/nullptr,
+          /*allow_unprepared_value=*/false, &tombstone_iter_ptr,
+          db_options_->statistics.get(), clock_);
+      list[num - 1]->RegisterCleanup(&CleanupLevelFilesBriefArena, run_arena,
+                                     run_brief);
+      range_tombstones.emplace_back(nullptr, tombstone_iter_ptr);
+      run_files.clear();
+    };
+
+    for (FileMetaData* file : *c->inputs(0)) {
+      if (!has_current_run || file->sorted_run_id != current_run_id) {
+        flush_run();
+        current_run_id = file->sorted_run_id;
+        has_current_run = true;
+      }
+      run_files.push_back(file);
+    }
+    flush_run();
+  } else {
   for (size_t which = 0; which < c->num_input_levels(); which++) {
     const LevelFilesBrief* flevel = c->input_levels(which);
     num_input_files += flevel->num_files;
@@ -8103,6 +8309,7 @@ InternalIterator* VersionSet::MakeInputIterator(
         range_tombstones.emplace_back(nullptr, tombstone_iter_ptr);
       }
     }
+  }
   }
   TEST_SYNC_POINT_CALLBACK(
       "VersionSet::MakeInputIterator:NewCompactionMergingIterator",
@@ -8176,6 +8383,7 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
         filemetadata.relative_filename = filemetadata.name.substr(1);
         filemetadata.file_number = file_number;
         filemetadata.level = level;
+        filemetadata.sorted_run_id = file->sorted_run_id;
         filemetadata.size = file->fd.GetFileSize();
         filemetadata.smallestkey = file->smallest.user_key().ToString();
         filemetadata.largestkey = file->largest.user_key().ToString();

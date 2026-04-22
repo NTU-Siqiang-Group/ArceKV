@@ -2497,6 +2497,7 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
     FileMetaData meta;
     meta.fd = FileDescriptor(file_number,
                              sub_compact->compaction->output_path_id(), 0);
+    meta.sorted_run_id = sub_compact->compaction->output_sorted_run_id();
     meta.oldest_ancester_time = oldest_ancester_time;
     meta.file_creation_time = current_time;
     meta.epoch_number = epoch_number;

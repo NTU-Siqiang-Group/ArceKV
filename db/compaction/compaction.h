@@ -128,6 +128,8 @@ class Compaction {
   // Outputs will go to this level
   int output_level() const { return output_level_; }
 
+  uint64_t output_sorted_run_id() const { return output_sorted_run_id_; }
+
   // Returns the number of input levels in this compaction.
   size_t num_input_levels() const { return inputs_.size(); }
 
@@ -548,6 +550,7 @@ class Compaction {
   Arena arena_;  // Arena used to allocate space for file_levels_
 
   const uint32_t output_path_id_;
+  uint64_t output_sorted_run_id_ = 0;
   CompressionType output_compression_;
   CompressionOptions output_compression_opts_;
   Temperature output_temperature_override_;

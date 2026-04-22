@@ -343,6 +343,59 @@ TEST_F(TieredVersionStorageInfoTest,
       Slice("100"), Slice("199"), /*last_level=*/1, /*last_l0_idx=*/-1));
 }
 
+TEST_F(TieredVersionStorageInfoTest, TieredRunCountingForCompaction) {
+  Add(0, 1U, "010", "019", 0, kInvalidBlobFileNumber, 0, /*sorted_run_id=*/1);
+  Add(0, 2U, "020", "029", 0, kInvalidBlobFileNumber, 0, /*sorted_run_id=*/2);
+  Add(1, 11U, "100", "149", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(1, 12U, "150", "199", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(1, 21U, "120", "169", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/20);
+  Add(1, 22U, "170", "219", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/20);
+  Add(1, 31U, "130", "139", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/30);
+
+  UpdateVersionStorageInfo();
+
+  ASSERT_EQ(2U, vstorage_.NumTieredRunsForCompaction(0));
+  ASSERT_EQ(3U, vstorage_.NumTieredRunsForCompaction(1));
+}
+
+TEST_F(TieredVersionStorageInfoTest,
+       TieredCompactionScoreTriggersAtRunLimitAndSkipsBusyLevels) {
+  mutable_cf_options_.max_bytes_for_level_multiplier = 2;
+  Add(1, 11U, "100", "149", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(1, 12U, "150", "199", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/10);
+  Add(1, 21U, "120", "169", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/20);
+  Add(1, 31U, "130", "139", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/30);
+  Add(2, 41U, "200", "249", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/40);
+  Add(2, 42U, "250", "299", 0, kInvalidBlobFileNumber, 0,
+      /*sorted_run_id=*/50);
+
+  UpdateVersionStorageInfo();
+  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_,
+                                   /*full_history_ts_low=*/"");
+
+  ASSERT_EQ(1, vstorage_.CompactionScoreLevel(0));
+  ASSERT_DOUBLE_EQ(1.5, vstorage_.CompactionScore(0));
+  ASSERT_EQ(2, vstorage_.CompactionScoreLevel(1));
+  ASSERT_DOUBLE_EQ(1.0, vstorage_.CompactionScore(1));
+
+  vstorage_.LevelFiles(1)[0]->being_compacted = true;
+  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_,
+                                   /*full_history_ts_low=*/"");
+  ASSERT_EQ(0U, vstorage_.NumTieredRunsForCompaction(1));
+  ASSERT_EQ(2, vstorage_.CompactionScoreLevel(0));
+  ASSERT_DOUBLE_EQ(1.0, vstorage_.CompactionScore(0));
+}
+
 TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_1) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;

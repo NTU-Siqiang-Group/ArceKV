@@ -68,6 +68,10 @@ uint64_t TotalFileSize(const std::vector<FileMetaData*>& files) {
 void Compaction::FinalizeInputInfo(Version* _input_version) {
   input_version_ = _input_version;
   cfd_ = input_version_->cfd();
+  if (cfd_->ioptions().compaction_style == kCompactionStyleTiered &&
+      start_level_ != output_level_) {
+    output_sorted_run_id_ = input_version_->version_set()->NewSortedRunId();
+  }
 
   cfd_->Ref();
   input_version_->Ref();
@@ -80,12 +84,15 @@ void Compaction::GetBoundaryKeys(
     Slice* largest_user_key, int exclude_level) {
   bool initialized = false;
   const Comparator* ucmp = vstorage->InternalComparator()->user_comparator();
+  const bool is_tiered = vstorage->IsTiered();
   for (size_t i = 0; i < inputs.size(); ++i) {
     if (inputs[i].files.empty() || inputs[i].level == exclude_level) {
       continue;
     }
-    if (inputs[i].level == 0) {
-      // we need to consider all files on level 0
+    if (inputs[i].level == 0 || is_tiered) {
+      // Tiered compaction may compact a full non-L0 level containing multiple
+      // overlapping runs, so there is no globally ordered first/last file to
+      // summarize the range. Scan every file in those cases.
       for (const auto* f : inputs[i].files) {
         const Slice& start_user_key = f->smallest.user_key();
         if (!initialized ||
@@ -121,12 +128,14 @@ void Compaction::GetBoundaryInternalKeys(
     InternalKey* largest_key, int exclude_level) {
   bool initialized = false;
   const InternalKeyComparator* icmp = vstorage->InternalComparator();
+  const bool is_tiered = vstorage->IsTiered();
   for (size_t i = 0; i < inputs.size(); ++i) {
     if (inputs[i].files.empty() || inputs[i].level == exclude_level) {
       continue;
     }
-    if (inputs[i].level == 0) {
-      // we need to consider all files on level 0
+    if (inputs[i].level == 0 || is_tiered) {
+      // Tiered non-L0 inputs may contain multiple overlapping runs. Scan all
+      // files rather than assuming the first and last file bound the range.
       for (const auto* f : inputs[i].files) {
         if (!initialized || icmp->Compare(f->smallest, *smallest_key) < 0) {
           *smallest_key = f->smallest;
@@ -557,6 +566,13 @@ bool Compaction::IsTrivialMove() const {
   // a very expensive merge later on.
   // If start_level_== output_level_, the purpose is to force compaction
   // filter to be applied to that level, and thus cannot be a trivial move.
+
+  if (immutable_options_.compaction_style == kCompactionStyleTiered) {
+    // Tiered compaction must merge all runs from a level into a newly written
+    // run at the next level. A metadata-only move would preserve the old file
+    // layout and overlapping runs, which is not equivalent.
+    return false;
+  }
 
   // Check if start level have files with overlapping ranges
   if (start_level_ == 0 && input_vstorage_->level0_non_overlapping() == false &&

@@ -23,6 +23,7 @@
 #include "db/compaction/compaction_picker.h"
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
+#include "db/compaction/compaction_picker_tiered.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/db_impl/db_impl.h"
 #include "db/internal_stats.h"
@@ -686,13 +687,7 @@ ColumnFamilyData::ColumnFamilyData(
           new LevelCompactionPicker(ioptions_, &internal_comparator_));
     } else if (ioptions_.compaction_style == kCompactionStyleTiered) {
       compaction_picker_.reset(
-          new NullCompactionPicker(ioptions_, &internal_comparator_));
-      ROCKS_LOG_WARN(
-          ioptions_.logger,
-          "Column family %s uses kCompactionStyleTiered, but its compaction "
-          "picker is not implemented yet. Background compaction is disabled "
-          "until later milestones land.\n",
-          GetName().c_str());
+          new TieredCompactionPicker(ioptions_, &internal_comparator_));
     } else if (ioptions_.compaction_style == kCompactionStyleUniversal) {
       compaction_picker_.reset(
           new UniversalCompactionPicker(ioptions_, &internal_comparator_));

@@ -1358,7 +1358,8 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
             trim_ts);
         final_output_level = first_overlapped_level;
       } else {
-        assert(cfd->ioptions().compaction_style == kCompactionStyleLevel);
+        assert(cfd->ioptions().compaction_style == kCompactionStyleLevel ||
+               cfd->ioptions().compaction_style == kCompactionStyleTiered);
         uint64_t next_file_number = versions_->current_next_file_number();
         // Start compaction from `first_overlapped_level`, one level down at a
         // time, until output level >= max_overlapped_level.
@@ -1371,22 +1372,28 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
         for (;;) {
           // Always allow L0 -> L1 compaction
           if (level > 0) {
-            if (cfd->ioptions().level_compaction_dynamic_level_bytes) {
-              assert(final_output_level < cfd->ioptions().num_levels);
-              if (final_output_level + 1 == cfd->ioptions().num_levels) {
-                break;
+            if (cfd->ioptions().compaction_style == kCompactionStyleLevel) {
+              if (cfd->ioptions().level_compaction_dynamic_level_bytes) {
+                assert(final_output_level < cfd->ioptions().num_levels);
+                if (final_output_level + 1 == cfd->ioptions().num_levels) {
+                  break;
+                }
+              } else {
+                // TODO(cbi): there is still a race condition here where
+                //  if a background compaction compacts some file beyond
+                //  current()->storage_info()->num_non_empty_levels() right after
+                //  the check here.This should happen very infrequently and should
+                //  not happen once a user populates the last level of the LSM.
+                InstrumentedMutexLock l(&mutex_);
+                // num_non_empty_levels may be lower after a compaction, so
+                // we check for >= here.
+                if (final_output_level + 1 >=
+                    cfd->current()->storage_info()->num_non_empty_levels()) {
+                  break;
+                }
               }
             } else {
-              // TODO(cbi): there is still a race condition here where
-              //  if a background compaction compacts some file beyond
-              //  current()->storage_info()->num_non_empty_levels() right after
-              //  the check here.This should happen very infrequently and should
-              //  not happen once a user populates the last level of the LSM.
-              InstrumentedMutexLock l(&mutex_);
-              // num_non_empty_levels may be lower after a compaction, so
-              // we check for >= here.
-              if (final_output_level + 1 >=
-                  cfd->current()->storage_info()->num_non_empty_levels()) {
+              if (final_output_level + 1 >= cfd->ioptions().num_levels) {
                 break;
               }
             }
@@ -1419,7 +1426,8 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
           TEST_SYNC_POINT("DBImpl::RunManualCompaction()::1");
           TEST_SYNC_POINT("DBImpl::RunManualCompaction()::2");
         }
-        if (s.ok()) {
+        if (s.ok() &&
+            cfd->ioptions().compaction_style == kCompactionStyleLevel) {
           assert(final_output_level > 0);
           // bottommost level intra-level compaction
           if ((options.bottommost_level_compaction ==

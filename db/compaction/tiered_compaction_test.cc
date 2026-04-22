@@ -9,6 +9,9 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "db/db_test_util.h"
+
+#include <set>
+
 #include "options/cf_options.h"
 #include "port/stack_trace.h"
 #include "rocksdb/iostats_context.h"
@@ -124,6 +127,17 @@ class TieredCompactionTest : public DBTestBase {
     options.last_level_temperature = Temperature::kCold;
   }
 
+  ColumnFamilyData* GetDefaultCfd() {
+    VersionSet* const versions = dbfull()->GetVersionSet();
+    assert(versions);
+    assert(versions->GetColumnFamilySet());
+    return versions->GetColumnFamilySet()->GetDefault();
+  }
+
+  const VersionStorageInfo* GetDefaultStorageInfo() {
+    return GetDefaultCfd()->current()->storage_info();
+  }
+
  private:
   void VerifyCompactionStats(
       const InternalStats::CompactionStats& stats,
@@ -172,6 +186,178 @@ class TieredCompactionTest : public DBTestBase {
     ASSERT_EQ(job_stats.num_output_records, expected_stats.num_output_records);
   }
 };
+
+TEST_F(TieredCompactionTest, TieredBackgroundCompactionAssignsDistinctRunIds) {
+  std::atomic_bool trivial_move_seen = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCompaction:TrivialMove",
+      [&](void* /*arg*/) { trivial_move_seen.store(true); });
+  auto clear_trivial_move_callback = [&] {
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::BackgroundCompaction:TrivialMove");
+  };
+  Defer defer_clear_callback(clear_trivial_move_callback);
+
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleTiered;
+  options.disable_auto_compactions = false;
+  options.max_background_jobs = 4;
+  options.write_buffer_size = 32 * 1024;
+  options.target_file_size_base = 4 * 1024;
+  options.max_bytes_for_level_base = 4 * 1024;
+  options.max_bytes_for_level_multiplier = 1;
+  options.level0_file_num_compaction_trigger = 1000;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  auto write_batch = [&](int batch) {
+    for (int i = 0; i < 400; ++i) {
+      ASSERT_OK(Put(Key(i), "batch" + std::to_string(batch)));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  };
+
+  write_batch(1);
+  write_batch(2);
+  write_batch(3);
+  write_batch(4);
+
+  const VersionStorageInfo* vstorage = GetDefaultStorageInfo();
+  bool found_tiered_run = false;
+  for (int level = 1; level < vstorage->num_non_empty_levels(); ++level) {
+    const auto& runs = vstorage->LevelSortedRuns(level).runs;
+    std::set<uint64_t> level_run_ids;
+    for (const auto& run : runs) {
+      ASSERT_NE(0U, run.sorted_run_id);
+      ASSERT_TRUE(level_run_ids.insert(run.sorted_run_id).second);
+      for (size_t i = 0; i < run.files.num_files; ++i) {
+        ASSERT_EQ(run.sorted_run_id,
+                  run.files.files[i].file_metadata->sorted_run_id);
+      }
+      found_tiered_run = true;
+    }
+  }
+  ASSERT_TRUE(found_tiered_run);
+  ASSERT_FALSE(trivial_move_seen.load());
+}
+
+TEST_F(TieredCompactionTest, TieredCompactionAcrossRunsPreservesNewestValues) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleTiered;
+  options.disable_auto_compactions = false;
+  options.max_background_jobs = 4;
+  options.write_buffer_size = 32 * 1024;
+  options.target_file_size_base = 4 * 1024;
+  options.max_bytes_for_level_base = 4 * 1024;
+  options.max_bytes_for_level_multiplier = 2;
+  options.level0_file_num_compaction_trigger = 1000;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  auto write_batch = [&](int batch, int start_key) {
+    for (int i = 0; i < 400; ++i) {
+      ASSERT_OK(Put(Key(start_key + i), "batch" + std::to_string(batch)));
+    }
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_OK(Put(Key(i), "override" + std::to_string(batch)));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  };
+
+  write_batch(1, 0);
+  write_batch(2, 100);
+  write_batch(3, 200);
+
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ("override3", Get(Key(10)));
+  ASSERT_EQ("override3", Get(Key(150)));
+  ASSERT_EQ("batch3", Get(Key(350)));
+
+  const VersionStorageInfo* vstorage = GetDefaultStorageInfo();
+  bool found_non_l0_data = false;
+  for (int level = 1; level < vstorage->num_non_empty_levels(); ++level) {
+    if (vstorage->NumLevelFiles(level) > 0) {
+      found_non_l0_data = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found_non_l0_data);
+}
+
+TEST_F(TieredCompactionTest, TieredManualCompactionReopenPreservesRuns) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleTiered;
+  options.disable_auto_compactions = true;
+  options.write_buffer_size = 32 * 1024;
+  options.target_file_size_base = 4 * 1024;
+  options.max_bytes_for_level_base = 4 * 1024;
+  options.max_bytes_for_level_multiplier = 1000;
+  options.level0_file_num_compaction_trigger = 1000;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  auto flush_batch = [&](int batch, int start_key) {
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_OK(Put(Key(start_key + i), "batch" + std::to_string(batch)));
+    }
+    for (int i = 0; i < 50; ++i) {
+      ASSERT_OK(Put(Key(i), "override" + std::to_string(batch)));
+    }
+    ASSERT_OK(Flush());
+  };
+
+  flush_batch(1, 100);
+  flush_batch(2, 200);
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  flush_batch(3, 300);
+  flush_batch(4, 400);
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  const VersionStorageInfo* vstorage = GetDefaultStorageInfo();
+  ASSERT_EQ(2U, vstorage->NumSortedRuns(1));
+  ASSERT_EQ(2U, vstorage->LevelSortedRuns(1).runs.size());
+  ASSERT_NE(vstorage->LevelSortedRuns(1).runs[0].sorted_run_id,
+            vstorage->LevelSortedRuns(1).runs[1].sorted_run_id);
+
+  ASSERT_EQ("override4", Get(Key(10)));
+  ASSERT_EQ("batch2", Get(Key(250)));
+  ASSERT_EQ("batch4", Get(Key(450)));
+
+  Reopen(options);
+
+  vstorage = GetDefaultStorageInfo();
+  ASSERT_EQ(2U, vstorage->NumSortedRuns(1));
+  ASSERT_EQ(2U, vstorage->LevelSortedRuns(1).runs.size());
+  ASSERT_NE(vstorage->LevelSortedRuns(1).runs[0].sorted_run_id,
+            vstorage->LevelSortedRuns(1).runs[1].sorted_run_id);
+
+  ASSERT_EQ("override4", Get(Key(10)));
+  ASSERT_EQ("batch2", Get(Key(250)));
+  ASSERT_EQ("batch4", Get(Key(450)));
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(1, nullptr, nullptr));
+
+  vstorage = GetDefaultStorageInfo();
+  ASSERT_EQ(0U, vstorage->NumSortedRuns(1));
+  ASSERT_EQ(1U, vstorage->NumSortedRuns(2));
+  ASSERT_EQ(1U, vstorage->LevelSortedRuns(2).runs.size());
+  ASSERT_NE(0U, vstorage->LevelSortedRuns(2).runs[0].sorted_run_id);
+
+  Reopen(options);
+
+  vstorage = GetDefaultStorageInfo();
+  ASSERT_EQ(0U, vstorage->NumSortedRuns(1));
+  ASSERT_EQ(1U, vstorage->NumSortedRuns(2));
+  ASSERT_EQ(1U, vstorage->LevelSortedRuns(2).runs.size());
+
+  ASSERT_EQ("override4", Get(Key(10)));
+  ASSERT_EQ("batch2", Get(Key(250)));
+  ASSERT_EQ("batch4", Get(Key(450)));
+}
 
 TEST_F(TieredCompactionTest, SequenceBasedTieredStorageUniversal) {
   const int kNumTrigger = 4;

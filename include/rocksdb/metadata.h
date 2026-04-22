@@ -168,6 +168,9 @@ struct SstFileMetaData : public FileStorageInfo {
 struct LiveFileMetaData : SstFileMetaData {
   std::string column_family_name;  // Name of the column family
   int level;                       // Level at which this file resides.
+  // For tiered compaction, non-zero sorted_run_id identifies the sorted run
+  // this file belongs to within its level.
+  uint64_t sorted_run_id = 0;
   LiveFileMetaData() : column_family_name(), level(0) {}
 };
 

@@ -43,3 +43,9 @@ add_executable(multi_processes_example
   multi_processes_example.cc)
 target_link_libraries(multi_processes_example
   ${ROCKSDB_LIB})
+
+add_executable(tiered_compaction_integration
+  EXCLUDE_FROM_ALL
+  tiered_compaction_integration.cc)
+target_link_libraries(tiered_compaction_integration
+  ${ROCKSDB_LIB})

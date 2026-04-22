@@ -12,6 +12,7 @@
 #include "db/compaction/compaction.h"
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
+#include "db/compaction/compaction_picker_tiered.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/compaction/file_pri.h"
 #include "rocksdb/advanced_options.h"
@@ -40,6 +41,7 @@ class CompactionPickerTestBase : public testing::Test {
   MutableCFOptions mutable_cf_options_;
   MutableDBOptions mutable_db_options_;
   LevelCompactionPicker level_compaction_picker;
+  TieredCompactionPicker tiered_compaction_picker;
   std::string cf_name_;
   CountingLogger logger_;
   LogBuffer log_buffer_;
@@ -61,6 +63,7 @@ class CompactionPickerTestBase : public testing::Test {
         mutable_cf_options_(options_),
         mutable_db_options_(),
         level_compaction_picker(ioptions_, &icmp_),
+        tiered_compaction_picker(ioptions_, &icmp_),
         cf_name_("dummy"),
         log_buffer_(InfoLogLevel::INFO_LEVEL, &logger_),
         file_num_(1),
@@ -121,7 +124,8 @@ class CompactionPickerTestBase : public testing::Test {
            uint64_t oldest_ancestor_time = kUnknownOldestAncesterTime,
            uint64_t newest_key_time = kUnknownNewestKeyTime,
            Slice ts_of_smallest = Slice(), Slice ts_of_largest = Slice(),
-           uint64_t epoch_number = kUnknownEpochNumber) {
+           uint64_t epoch_number = kUnknownEpochNumber,
+           uint64_t sorted_run_id = 0) {
     assert(ts_of_smallest.size() == ucmp_->timestamp_size());
     assert(ts_of_largest.size() == ucmp_->timestamp_size());
 
@@ -167,6 +171,7 @@ class CompactionPickerTestBase : public testing::Test {
         "" /* max timestamp */);
     f->compensated_file_size =
         (compensated_file_size != 0) ? compensated_file_size : file_size;
+    f->sorted_run_id = sorted_run_id;
     // oldest_ancester_time is only used if newest_key_time is not available
     f->oldest_ancester_time = oldest_ancestor_time;
     // Set min/max timestamps for UDT support
@@ -259,6 +264,14 @@ class CompactionPickerTestBase : public testing::Test {
   std::unique_ptr<Compaction> PickFIFOCompaction(FIFOCompactionPicker& picker) {
     UpdateVersionStorageInfo();
     return std::unique_ptr<Compaction>(picker.PickCompaction(
+        cf_name_, mutable_cf_options_, mutable_db_options_,
+        /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
+        vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
+  }
+
+  std::unique_ptr<Compaction> PickTieredCompaction() {
+    UpdateVersionStorageInfo();
+    return std::unique_ptr<Compaction>(tiered_compaction_picker.PickCompaction(
         cf_name_, mutable_cf_options_, mutable_db_options_,
         /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
         vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
@@ -434,6 +447,199 @@ TEST_F(CompactionPickerTest, Level1Trigger2) {
   ASSERT_EQ(6U, compaction->input(1, 0)->fd.GetNumber());
   ASSERT_EQ(7U, compaction->input(1, 1)->fd.GetNumber());
   ASSERT_EQ(uint64_t{1073741824}, compaction->OutputFilePreallocationSize());
+}
+
+TEST_F(CompactionPickerTest, TieredTriggersAtRunLimit) {
+  ioptions_.compaction_style = kCompactionStyleTiered;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 2;
+  mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+  NewVersionStorage(6, kCompactionStyleTiered);
+
+  Add(1, 11U, "100", "149", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 12U, "150", "199", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 21U, "120", "169", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+
+  UpdateVersionStorageInfo();
+  vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_,
+                                    /*full_history_ts_low=*/"");
+  ASSERT_TRUE(tiered_compaction_picker.NeedsCompaction(vstorage_.get()));
+  std::unique_ptr<Compaction> compaction(
+      tiered_compaction_picker.PickCompaction(
+          cf_name_, mutable_cf_options_, mutable_db_options_,
+          /*existing_snapshots=*/{},
+          /*snapshot_checker=*/nullptr, vstorage_.get(), &log_buffer_,
+          /*full_history_ts_low=*/""));
+  ASSERT_NE(nullptr, compaction.get());
+  ASSERT_EQ(1, compaction->start_level());
+  ASSERT_EQ(2, compaction->output_level());
+  ASSERT_EQ(3U, compaction->num_input_files(0));
+  ASSERT_EQ(CompactionReason::kLevelMaxLevelSize,
+            compaction->compaction_reason());
+}
+
+TEST_F(CompactionPickerTest, TieredPicksOldestRunsUpToRunLimit) {
+  ioptions_.compaction_style = kCompactionStyleTiered;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 2;
+  mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+  NewVersionStorage(6, kCompactionStyleTiered);
+
+  Add(1, 11U, "100", "149", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 12U, "150", "199", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 21U, "120", "169", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  Add(1, 31U, "130", "139", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 30);
+
+  Add(2, 41U, "200", "214", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 40);
+  Add(2, 42U, "215", "229", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 40);
+  Add(2, 51U, "230", "244", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 50);
+  Add(2, 52U, "245", "259", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 50);
+  Add(2, 61U, "260", "289", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 60);
+  Add(2, 71U, "290", "319", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 70);
+
+  std::unique_ptr<Compaction> compaction = PickTieredCompaction();
+  ASSERT_NE(nullptr, compaction.get());
+  ASSERT_EQ(2, compaction->start_level());
+  ASSERT_EQ(3, compaction->output_level());
+  ASSERT_EQ(1U, compaction->num_input_levels());
+  ASSERT_EQ(4U, compaction->num_input_files(0));
+  ASSERT_EQ(41U, compaction->input(0, 0)->fd.GetNumber());
+  ASSERT_EQ(42U, compaction->input(0, 1)->fd.GetNumber());
+  ASSERT_EQ(51U, compaction->input(0, 2)->fd.GetNumber());
+  ASSERT_EQ(52U, compaction->input(0, 3)->fd.GetNumber());
+  ASSERT_EQ(CompactionReason::kLevelMaxLevelSize,
+            compaction->compaction_reason());
+}
+
+TEST_F(CompactionPickerTest, TieredL0TriggerUsesFileCountAsRunCount) {
+  ioptions_.compaction_style = kCompactionStyleTiered;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 2;
+  mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+  NewVersionStorage(6, kCompactionStyleTiered);
+
+  Add(0, 1U, "010", "019");
+  Add(0, 2U, "020", "029");
+  Add(0, 3U, "030", "039");
+
+  std::unique_ptr<Compaction> compaction = PickTieredCompaction();
+  ASSERT_NE(nullptr, compaction.get());
+  ASSERT_EQ(0, compaction->start_level());
+  ASSERT_EQ(1, compaction->output_level());
+  ASSERT_EQ(2U, compaction->num_input_files(0));
+  ASSERT_EQ(1U, compaction->input(0, 0)->fd.GetNumber());
+  ASSERT_EQ(2U, compaction->input(0, 1)->fd.GetNumber());
+  ASSERT_EQ(CompactionReason::kLevelL0FilesNum,
+            compaction->compaction_reason());
+}
+
+TEST_F(CompactionPickerTest, TieredBusyLevelIsSkipped) {
+  ioptions_.compaction_style = kCompactionStyleTiered;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 2;
+  mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+  NewVersionStorage(6, kCompactionStyleTiered);
+
+  Add(1, 11U, "100", "149", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 21U, "120", "169", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  Add(1, 31U, "130", "139", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 30);
+  Add(2, 41U, "200", "249", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 40);
+  Add(2, 42U, "250", "299", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 50);
+  Add(2, 43U, "300", "349", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 60);
+
+  UpdateVersionStorageInfo();
+  vstorage_->LevelFiles(1)[0]->being_compacted = true;
+  vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_,
+                                    /*full_history_ts_low=*/"");
+
+  std::unique_ptr<Compaction> compaction(tiered_compaction_picker.PickCompaction(
+      cf_name_, mutable_cf_options_, mutable_db_options_,
+      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr, vstorage_.get(),
+      &log_buffer_, /*full_history_ts_low=*/""));
+  ASSERT_NE(nullptr, compaction.get());
+  ASSERT_EQ(2, compaction->start_level());
+  ASSERT_EQ(2U, compaction->num_input_files(0));
+  ASSERT_EQ(41U, compaction->input(0, 0)->fd.GetNumber());
+  ASSERT_EQ(42U, compaction->input(0, 1)->fd.GetNumber());
+}
+
+TEST_F(CompactionPickerTest, TieredCompactRangePicksWholeLevel) {
+  ioptions_.compaction_style = kCompactionStyleTiered;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 8;
+  mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+  NewVersionStorage(6, kCompactionStyleTiered);
+
+  Add(1, 11U, "100", "149", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 12U, "150", "199", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 21U, "120", "169", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  Add(1, 22U, "170", "219", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  UpdateVersionStorageInfo();
+
+  bool manual_conflict = false;
+  InternalKey begin("125", 100, kTypeValue);
+  InternalKey end("126", 100, kTypeValue);
+  InternalKey manual_end;
+  InternalKey* manual_end_ptr = &manual_end;
+  std::unique_ptr<Compaction> compaction(
+      tiered_compaction_picker.PickCompactionForCompactRange(
+          cf_name_, mutable_cf_options_, mutable_db_options_, vstorage_.get(),
+          /*input_level=*/1, /*output_level=*/2,
+          /*compact_range_options=*/{}, &begin, &end, &manual_end_ptr,
+          &manual_conflict,
+          /*max_file_num_to_ignore=*/std::numeric_limits<uint64_t>::max(),
+          /*trim_ts=*/"", /*full_history_ts_low=*/""));
+
+  ASSERT_FALSE(manual_conflict);
+  ASSERT_NE(nullptr, compaction.get());
+  ASSERT_EQ(nullptr, manual_end_ptr);
+  ASSERT_EQ(1, compaction->start_level());
+  ASSERT_EQ(2, compaction->output_level());
+  ASSERT_EQ(1U, compaction->num_input_levels());
+  ASSERT_EQ(4U, compaction->num_input_files(0));
+  ASSERT_EQ(11U, compaction->input(0, 0)->fd.GetNumber());
+  ASSERT_EQ(22U, compaction->input(0, 3)->fd.GetNumber());
 }
 
 TEST_F(CompactionPickerTest, LevelMaxScore) {
