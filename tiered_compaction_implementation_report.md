@@ -21,15 +21,18 @@ The current policy has these defining rules:
 
 The main implementation points are in:
 
-- [db/version_set.h](db/version_set.h)
-- [db/version_set.cc](db/version_set.cc)
-- [db/compaction/compaction_picker_tiered.h](db/compaction/compaction_picker_tiered.h)
-- [db/compaction/compaction_picker_tiered.cc](db/compaction/compaction_picker_tiered.cc)
-- [db/compaction/compaction.cc](db/compaction/compaction.cc)
-- [db/compaction/compaction_job.cc](db/compaction/compaction_job.cc)
-- [db/db_impl/db_impl_compaction_flush.cc](db/db_impl/db_impl_compaction_flush.cc)
-- [db/version_edit.h](db/version_edit.h)
-- [db/version_edit.cc](db/version_edit.cc)
+- run layout structs in [db/version_set.h](db/version_set.h#L123)
+- read-path helpers in [db/version_set.cc](db/version_set.cc#L355)
+- tiered compaction picker in
+  [db/compaction/compaction_picker_tiered.cc](db/compaction/compaction_picker_tiered.cc#L171)
+- output run-id assignment in
+  [db/compaction/compaction.cc](db/compaction/compaction.cc#L68)
+- output metadata installation in
+  [db/compaction/compaction_job.cc](db/compaction/compaction_job.cc#L1855)
+- persisted file metadata in [db/version_edit.h](db/version_edit.h#L245)
+- manifest encode/decode support in
+  [db/version_edit.cc](db/version_edit.cc#L235) and
+  [db/version_edit.cc](db/version_edit.cc#L398)
 
 ## 1. Tree Structure
 
@@ -59,17 +62,19 @@ fundamental sequence-number ordering semantics.
 
 ### 1.2 How the structure is materialized
 
-The base file metadata is still stored per file in `VersionStorageInfo`. The
-tiered structure is materialized as a derived view over the files in a level.
+The base file metadata is still stored per file in `VersionStorageInfo`
+([db/version_set.h](db/version_set.h#L141)). The tiered structure is
+materialized as a derived view over the files in a level.
 
 The main data types are:
 
-- `LevelSortedRunBrief` in [db/version_set.h](db/version_set.h)
-- `LevelSortedRunsBrief` in [db/version_set.h](db/version_set.h)
-- `sorted_run_id` added to `FileMetaData` and persisted in version edits
+- `SortedRunBrief` in [db/version_set.h](db/version_set.h#L123)
+- `LevelSortedRunsBrief` in [db/version_set.h](db/version_set.h#L128)
+- `sorted_run_id` on `FileMetaData` in
+  [db/version_edit.h](db/version_edit.h#L304)
 
 The derived run layout is built in
-[db/version_set.cc](db/version_set.cc:3653) by
+[db/version_set.cc](db/version_set.cc#L3653) by
 `VersionStorageInfo::GenerateLevelSortedRunsBrief()`.
 
 That function:
@@ -93,14 +98,18 @@ This value is:
 
 Relevant code:
 
+- file metadata field:
+  [db/version_edit.h](db/version_edit.h#L304)
 - manifest field definition:
-  [db/version_edit.h](db/version_edit.h)
+  [db/version_edit.h](db/version_edit.h#L115)
 - manifest encode/decode:
-  [db/version_edit.cc](db/version_edit.cc:347)
+  [db/version_edit.cc](db/version_edit.cc#L235) and
+  [db/version_edit.cc](db/version_edit.cc#L398)
 - public metadata exposure:
-  [include/rocksdb/metadata.h](include/rocksdb/metadata.h:171)
+  [include/rocksdb/metadata.h](include/rocksdb/metadata.h#L168)
 - live metadata population:
-  [db/version_set.cc](db/version_set.cc:8349)
+  `VersionSet::GetLiveFilesMetaData()` in
+  [db/version_set.cc](db/version_set.cc#L8349)
 
 ## 2. Consistent Reads
 
@@ -117,7 +126,7 @@ The tiered implementation is intentionally isolated from the leveled read path
 using explicit branching rather than rewriting the shared path globally.
 
 The main branch points are in
-[db/version_set.cc](db/version_set.cc):
+[db/version_set.cc](db/version_set.cc#L355):
 
 - point lookup selection via `TieredFilePicker`
 - iterator construction via `AddTieredIteratorsForLevel()`
@@ -128,7 +137,7 @@ This keeps the original leveled logic intact when
 ### 2.2 Point lookup path
 
 For point lookups, the tiered path is implemented by `TieredFilePicker` in
-[db/version_set.cc](db/version_set.cc:355).
+[db/version_set.cc](db/version_set.cc#L355).
 
 The logic is:
 
@@ -173,8 +182,8 @@ When overlapping runs exist in one level:
 
 The tiered tests that validate this include:
 
-- [db/version_set_test.cc](db/version_set_test.cc:1858)
-- [db/version_set_test.cc](db/version_set_test.cc:1963)
+- [db/version_set_test.cc](db/version_set_test.cc#L1858)
+- [db/version_set_test.cc](db/version_set_test.cc#L1963)
 
 ### 2.4 Iterator design
 
@@ -183,18 +192,20 @@ Range lookup and full iteration cannot assume one run per level either.
 The tiered iterator path is:
 
 - `Version::AddTieredIteratorsForLevel()` for user iteration:
-  [db/version_set.cc](db/version_set.cc:2558)
+  [db/version_set.cc](db/version_set.cc#L2563)
 - `VersionSet::MakeInputIterator()` for compaction input iteration:
-  [db/version_set.cc](db/version_set.cc:8160)
+  [db/version_set.cc](db/version_set.cc#L8160)
 
 For user iterators:
 
 - `L0` adds one table iterator per file, matching standard overlapping-L0
   semantics
 - each non-L0 sorted run contributes one run iterator
-- a run iterator is implemented by reusing `LevelIterator` over that run's
-  `LevelFilesBrief`
-- the outer merge iterator merges all run iterators together
+- a run iterator is implemented by reusing `LevelIterator`
+  ([db/version_set.cc](db/version_set.cc#L1058)) over that run's
+  `LevelFilesBrief` ([db/version_edit.h](db/version_edit.h#L518))
+- the outer `MergeIteratorBuilder` merges all run iterators together
+  ([table/merging_iterator.h](table/merging_iterator.h#L49))
 
 This works because:
 
@@ -218,15 +229,15 @@ selected only some runs.
 
 Tiered iterator tests include:
 
-- [db/version_set_test.cc](db/version_set_test.cc:1893)
-- [db/version_set_test.cc](db/version_set_test.cc:1918)
+- [db/version_set_test.cc](db/version_set_test.cc#L1893)
+- [db/version_set_test.cc](db/version_set_test.cc#L1918)
 
 ## 3. Compaction
 
 ### 3.1 Trigger condition and scoring
 
 Tiered compaction scoring is implemented in
-[db/version_set.cc](db/version_set.cc:4073) inside
+[db/version_set.cc](db/version_set.cc#L4073) inside
 `VersionStorageInfo::ComputeCompactionScore()`.
 
 For tiered style, score is based on run count, not bytes:
@@ -243,7 +254,7 @@ That means:
 - levels with higher run-count pressure rank higher
 
 `NumTieredRunsForCompaction()` is in
-[db/version_set.cc](db/version_set.cc:3692).
+[db/version_set.cc](db/version_set.cc#L3697).
 
 Behavior:
 
@@ -255,7 +266,7 @@ Behavior:
 ### 3.2 Picking inputs
 
 Automatic tiered picking is implemented in
-[db/compaction/compaction_picker_tiered.cc](db/compaction/compaction_picker_tiered.cc:171).
+[db/compaction/compaction_picker_tiered.cc](db/compaction/compaction_picker_tiered.cc#L171).
 
 Current automatic policy:
 
@@ -265,7 +276,8 @@ Current automatic policy:
 - compact those selected runs into one new run at `level + 1`
 
 This bounded-run selection is done by
-`SelectTieredCompactionInputs()` in the same file.
+`SelectTieredCompactionInputs()` in
+[db/compaction/compaction_picker_tiered.cc](db/compaction/compaction_picker_tiered.cc#L24).
 
 Selection details:
 
@@ -281,7 +293,7 @@ into one oversized run.
 Manual compaction is separate:
 
 - `PickCompactionForCompactRange()` in
-  [db/compaction/compaction_picker_tiered.cc](db/compaction/compaction_picker_tiered.cc:108)
+  [db/compaction/compaction_picker_tiered.cc](db/compaction/compaction_picker_tiered.cc#L66)
 - for tiered manual compaction, if the requested range overlaps a level, the
   implementation picks the whole level
 
@@ -292,7 +304,8 @@ automatic bounded-run policy.
 
 Once a compaction is picked:
 
-- the selected input files are wrapped into `CompactionInputFiles`
+- the selected input files are wrapped into `CompactionInputFiles` in
+  [db/compaction/compaction.h](db/compaction/compaction.h#L67)
 - the compaction output level is `input_level + 1`
 - the merge iterator reads the selected runs and produces one sorted output
   stream
@@ -300,7 +313,7 @@ Once a compaction is picked:
   `output_sorted_run_id`
 
 The run ID assignment is created in
-[db/compaction/compaction.cc](db/compaction/compaction.cc:68)
+[db/compaction/compaction.cc](db/compaction/compaction.cc#L68)
 inside `Compaction::FinalizeInputInfo()`.
 
 For tiered compaction:
@@ -309,8 +322,8 @@ For tiered compaction:
 - `output_sorted_run_id_ = version_set()->NewSortedRunId()`
 
 Then, during output file installation, every file produced by that compaction
-inherits that same run ID in
-[db/compaction/compaction_job.cc](db/compaction/compaction_job.cc:2500).
+inherits that same run ID inside `CompactionJob::ProcessKeyValueCompaction()`
+([db/compaction/compaction_job.cc](db/compaction/compaction_job.cc#L1855)).
 
 That is how multiple output SSTs from one compaction become one new sorted run.
 
@@ -321,7 +334,7 @@ Recognition is entirely metadata-based:
 - every output file from the compaction gets the same `sorted_run_id`
 - on the next version build, files in a level are regrouped by `sorted_run_id`
 - those files are sorted by smallest key inside the run
-- the regrouped result becomes one `LevelSortedRunBrief`
+- the regrouped result becomes one `SortedRunBrief`
 
 So "being a run" is not a separate persistent object. It is reconstructed from
 per-file run IDs.
@@ -333,7 +346,7 @@ non-L0 level is one globally ordered file chain. That is not true for tiered
 levels with multiple runs.
 
 To avoid corrupt assumptions, boundary helpers in
-[db/compaction/compaction.cc](db/compaction/compaction.cc:81)
+[db/compaction/compaction.cc](db/compaction/compaction.cc#L81)
 were updated so that for tiered compactions they scan every input file when
 computing smallest/largest boundaries, rather than relying on just the first
 and last file of the level.
@@ -352,8 +365,10 @@ For each new SST file, the manifest entry now includes:
 
 This is handled by:
 
-- encode in [db/version_edit.cc](db/version_edit.cc:347)
-- decode in [db/version_edit.cc](db/version_edit.cc:504)
+- encode in `VersionEdit::EncodeToNewFile4()`:
+  [db/version_edit.cc](db/version_edit.cc#L235)
+- decode in `VersionEdit::DecodeNewFile4From()`:
+  [db/version_edit.cc](db/version_edit.cc#L398)
 
 ### 4.2 How reopen reconstructs runs
 
@@ -377,7 +392,7 @@ This is one of the main reasons the manifest change is central to the design:
 The system must also avoid reusing run IDs after reopen.
 
 That is handled in
-[db/version_set.cc](db/version_set.cc:7158).
+`VersionSet::Recover()` in [db/version_set.cc](db/version_set.cc#L7102).
 
 During recovery:
 
@@ -388,7 +403,7 @@ During recovery:
 Fresh run IDs are then allocated by:
 
 - `VersionSet::NewSortedRunId()` in
-  [db/version_set.h](db/version_set.h:1459)
+  [db/version_set.h](db/version_set.h#L1459)
 
 This guarantees that every future compaction-generated run gets a distinct
 monotonically increasing ID.
@@ -399,7 +414,7 @@ The public metadata surface was also updated so that tools can reconstruct the
 same run layout after reopen using `GetLiveFilesMetaData()`.
 
 That is why `LiveFileMetaData` now exposes `sorted_run_id` in
-[include/rocksdb/metadata.h](include/rocksdb/metadata.h:171).
+[include/rocksdb/metadata.h](include/rocksdb/metadata.h#L173).
 
 The standalone integration tool uses exactly that API to reconstruct and print
 the tiered tree.

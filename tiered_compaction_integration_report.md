@@ -21,15 +21,15 @@ The driver:
 
 ## Files Added Or Changed
 
-- [examples/tiered_compaction_integration.cc](examples/tiered_compaction_integration.cc)
+- [examples/tiered_compaction_integration.cc](examples/tiered_compaction_integration.cc#L303)
   Standalone integration driver.
-- [examples/CMakeLists.txt](examples/CMakeLists.txt)
+- [examples/CMakeLists.txt](examples/CMakeLists.txt#L47)
   Adds a CMake target for the driver.
-- [examples/Makefile](examples/Makefile)
+- [examples/Makefile](examples/Makefile#L54)
   Adds a Makefile target for the driver.
-- [include/rocksdb/metadata.h](include/rocksdb/metadata.h)
+- [include/rocksdb/metadata.h](include/rocksdb/metadata.h#L168)
   Exposes `sorted_run_id` through `LiveFileMetaData`.
-- [db/version_set.cc](db/version_set.cc)
+- [db/version_set.cc](db/version_set.cc#L8349)
   Populates `LiveFileMetaData.sorted_run_id`.
 
 ## Public API Issue Fixed
