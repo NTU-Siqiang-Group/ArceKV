@@ -33,9 +33,11 @@ enum CompactionStyle : char {
   kCompactionStyleFIFO = 0x2,
   // Tiered compaction style
   kCompactionStyleTiered = 0x3,
+  // UDP compaction style
+  kCompactionStyleUDP = 0x4,
   // Disable background compaction. Compaction jobs are submitted
   // via CompactFiles().
-  kCompactionStyleNone = 0x4,
+  kCompactionStyleNone = 0x5,
 };
 
 // In Level-based compaction, it Determines which file from a level to be

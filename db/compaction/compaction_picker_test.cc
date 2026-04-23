@@ -13,6 +13,7 @@
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_tiered.h"
+#include "db/compaction/compaction_picker_udp.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/compaction/file_pri.h"
 #include "rocksdb/advanced_options.h"
@@ -640,6 +641,41 @@ TEST_F(CompactionPickerTest, TieredCompactRangePicksWholeLevel) {
   ASSERT_EQ(4U, compaction->num_input_files(0));
   ASSERT_EQ(11U, compaction->input(0, 0)->fd.GetNumber());
   ASSERT_EQ(22U, compaction->input(0, 3)->fd.GetNumber());
+}
+
+TEST_F(CompactionPickerTest, UDPNeedsCompactionWithoutScores) {
+  ioptions_.compaction_style = kCompactionStyleUDP;
+  mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+  NewVersionStorage(3, kCompactionStyleUDP);
+
+  Add(2, 11U, "100", "149", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(2, 21U, "120", "169", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  Add(2, 31U, "130", "139", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 30);
+  UpdateVersionStorageInfo();
+
+  UDPCompactionPicker udp_compaction_picker(ioptions_, &icmp_);
+  ASSERT_TRUE(udp_compaction_picker.NeedsCompaction(vstorage_.get()));
+  for (int level = 0; level < vstorage_->num_levels(); ++level) {
+    ASSERT_EQ(0.0, vstorage_->CompactionScore(level));
+  }
+
+  std::unique_ptr<Compaction> compaction(
+      udp_compaction_picker.PickCompaction(
+          cf_name_, mutable_cf_options_, mutable_db_options_,
+          /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
+          vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
+  ASSERT_NE(nullptr, compaction.get());
+  ASSERT_EQ(2, compaction->start_level());
+  ASSERT_EQ(2, compaction->output_level());
+  ASSERT_EQ(1U, compaction->num_input_levels());
+  ASSERT_GE(compaction->num_input_files(0), 1U);
+  ASSERT_LE(compaction->num_input_files(0), 3U);
 }
 
 TEST_F(CompactionPickerTest, LevelMaxScore) {

@@ -130,6 +130,10 @@ class Compaction {
 
   uint64_t output_sorted_run_id() const { return output_sorted_run_id_; }
 
+  void set_preselected_output_sorted_run_id(uint64_t sorted_run_id) {
+    preselected_output_sorted_run_id_ = sorted_run_id;
+  }
+
   // Returns the number of input levels in this compaction.
   size_t num_input_levels() const { return inputs_.size(); }
 
@@ -551,6 +555,7 @@ class Compaction {
 
   const uint32_t output_path_id_;
   uint64_t output_sorted_run_id_ = 0;
+  uint64_t preselected_output_sorted_run_id_ = 0;
   CompressionType output_compression_;
   CompressionOptions output_compression_opts_;
   Temperature output_temperature_override_;

@@ -729,6 +729,7 @@ set(SOURCES
         db/compaction/compaction_picker_fifo.cc
         db/compaction/compaction_picker_level.cc
         db/compaction/compaction_picker_tiered.cc
+        db/compaction/compaction_picker_udp.cc
         db/compaction/compaction_picker_universal.cc
         db/compaction/compaction_service_job.cc
         db/compaction/compaction_state.cc

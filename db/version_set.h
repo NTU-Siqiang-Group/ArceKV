@@ -494,6 +494,10 @@ class VersionStorageInfo {
 
   bool IsTiered() const { return compaction_style_ == kCompactionStyleTiered; }
 
+  bool IsUDP() const { return compaction_style_ == kCompactionStyleUDP; }
+
+  bool IsSortedRunStyle() const { return IsTiered() || IsUDP(); }
+
   const LevelSortedRunsBrief& LevelSortedRuns(int level) const {
     assert(level < static_cast<int>(level_sorted_runs_brief_.size()));
     return level_sorted_runs_brief_[level];

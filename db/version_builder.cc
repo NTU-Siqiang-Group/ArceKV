@@ -605,9 +605,10 @@ class VersionBuilder::Rep {
             return Status::Corruption("VersionBuilder", oss.str());
           }
 
-          // Tiered levels may contain overlapping sorted runs, while leveled
-          // styles still require each level to be globally non-overlapping.
-          if (!vstorage->IsTiered() &&
+          // Sorted-run compaction styles may contain overlapping runs in a
+          // level, while leveled styles still require each level to be
+          // globally non-overlapping.
+          if (!vstorage->IsSortedRunStyle() &&
               icmp->Compare(lhs->largest, rhs->smallest) >= 0) {
             std::ostringstream oss;
             oss << 'L' << level << " has overlapping ranges: file #"

@@ -2451,7 +2451,7 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
     return;
   }
 
-  if (storage_info_.IsTiered()) {
+  if (storage_info_.IsSortedRunStyle()) {
     AddTieredIteratorsForLevel(read_options, soptions, merge_iter_builder,
                                level, allow_unprepared_value);
     return;
@@ -2625,7 +2625,7 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
 
   *overlap = false;
 
-  if (storage_info_.IsTiered()) {
+  if (storage_info_.IsSortedRunStyle()) {
     MergeIteratorBuilder merge_iter_builder(&icmp, &arena,
                                             false /* prefix_seek_mode */);
     AddTieredIteratorsForLevel(read_options, file_options, &merge_iter_builder,
@@ -2957,13 +2957,144 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     pinned_iters_mgr->StartPinning();
   }
 
+  if (storage_info_.IsUDP()) {
+    Arena arena;
+    MergeIteratorBuilder merge_iter_builder(internal_comparator(), &arena,
+                                            false /* prefix_seek_mode */);
+    for (int level = 0; level < storage_info_.num_non_empty_levels(); ++level) {
+      AddTieredIteratorsForLevel(read_options, file_options_,
+                                 &merge_iter_builder, level,
+                                 /*allow_unprepared_value=*/false);
+    }
+    ScopedArenaPtr<InternalIterator> iter(merge_iter_builder.Finish());
+    ParsedInternalKey parsed_key;
+    bool matched = false;
+    for (iter->Seek(ikey); iter->Valid(); iter->Next()) {
+      *status = ParseInternalKey(iter->key(), &parsed_key,
+                                 /*log_err_key=*/true);
+      if (!status->ok()) {
+        return;
+      }
+      if (!user_comparator()->EqualWithoutTimestamp(parsed_key.user_key,
+                                                    user_key)) {
+        break;
+      }
+      const bool need_more = get_context.SaveValue(
+          parsed_key, iter->value(), &matched, status,
+          /*value_pinner=*/nullptr);
+      if (!status->ok() || !need_more) {
+        break;
+      }
+    }
+    if (status->ok() && !iter->status().ok()) {
+      *status = iter->status();
+    }
+    if (!status->ok()) {
+      if (db_statistics_ != nullptr) {
+        get_context.ReportCounters();
+      }
+      return;
+    }
+
+    if (get_context.State() != GetContext::kNotFound &&
+        get_context.State() != GetContext::kMerge &&
+        db_statistics_ != nullptr) {
+      get_context.ReportCounters();
+    }
+    switch (get_context.State()) {
+      case GetContext::kNotFound:
+        break;
+      case GetContext::kMerge:
+        break;
+      case GetContext::kFound:
+        if (is_blob_index && do_merge && (value || columns)) {
+          Slice blob_index =
+              value ? *value
+                    : WideColumnsHelper::GetDefaultColumn(columns->columns());
+
+          TEST_SYNC_POINT_CALLBACK("Version::Get::TamperWithBlobIndex",
+                                   &blob_index);
+
+          constexpr FilePrefetchBuffer* prefetch_buffer = nullptr;
+
+          PinnableSlice result;
+
+          constexpr uint64_t* bytes_read = nullptr;
+
+          *status = GetBlob(read_options, get_context.ukey_to_get_blob_value(),
+                            blob_index, prefetch_buffer, &result, bytes_read);
+          if (!status->ok()) {
+            if (status->IsIncomplete()) {
+              get_context.MarkKeyMayExist();
+            }
+            return;
+          }
+
+          if (value) {
+            *value = std::move(result);
+          } else {
+            assert(columns);
+            columns->SetPlainValue(std::move(result));
+          }
+        }
+        return;
+      case GetContext::kDeleted:
+        *status = Status::NotFound();
+        return;
+      case GetContext::kCorrupt:
+        *status = Status::Corruption("corrupted key for ", user_key);
+        return;
+      case GetContext::kUnexpectedBlobIndex:
+        ROCKS_LOG_ERROR(info_log_, "Encounter unexpected blob index.");
+        *status = Status::NotSupported(
+            "Encounter unexpected blob index. Please open DB with "
+            "ROCKSDB_NAMESPACE::blob_db::BlobDB instead.");
+        return;
+      case GetContext::kMergeOperatorFailed:
+        *status = Status::Corruption(Status::SubCode::kMergeOperatorFailed);
+        return;
+    }
+    if (db_statistics_ != nullptr) {
+      get_context.ReportCounters();
+    }
+    if (GetContext::kMerge == get_context.State()) {
+      if (!do_merge) {
+        *status = Status::OK();
+        return;
+      }
+      if (!merge_operator_) {
+        *status = Status::InvalidArgument(
+            "merge_operator is not properly initialized.");
+        return;
+      }
+      if (value || columns) {
+        *status = MergeHelper::TimedFullMerge(
+            merge_operator_, user_key, MergeHelper::kNoBaseValue,
+            merge_context->GetOperands(), info_log_, db_statistics_, clock_,
+            /*update_num_ops_stats=*/true, /*op_failure_scope=*/nullptr,
+            value ? value->GetSelf() : nullptr, columns);
+        if (status->ok()) {
+          if (LIKELY(value != nullptr)) {
+            value->PinSelf();
+          }
+        }
+      }
+    } else {
+      if (key_exists != nullptr) {
+        *key_exists = false;
+      }
+      *status = Status::NotFound();
+    }
+    return;
+  }
+
   FilePicker fp(user_key, ikey, &storage_info_.level_files_brief_,
                 storage_info_.num_non_empty_levels_,
                 &storage_info_.file_indexer_, user_comparator(),
                 internal_comparator());
   std::unique_ptr<TieredFilePicker> tiered_fp;
   FdWithKeyRange* f = nullptr;
-  if (storage_info_.IsTiered()) {
+  if (storage_info_.IsSortedRunStyle()) {
     tiered_fp = std::make_unique<TieredFilePicker>(
         user_key, ikey, &storage_info_, user_comparator(),
         internal_comparator());
@@ -3140,7 +3271,7 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
     pinned_iters_mgr.StartPinning();
   }
 
-  if (storage_info_.IsTiered()) {
+  if (storage_info_.IsSortedRunStyle()) {
     for (auto iter = range->begin(); iter != range->end(); ++iter) {
       SequenceNumber seq = kMaxSequenceNumber;
       bool value_found = false;
@@ -3652,7 +3783,7 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
 
 void VersionStorageInfo::GenerateLevelSortedRunsBrief() {
   level_sorted_runs_brief_.resize(num_non_empty_levels_);
-  if (!IsTiered()) {
+  if (!IsSortedRunStyle()) {
     return;
   }
 
@@ -3698,7 +3829,7 @@ size_t VersionStorageInfo::NumTieredRunsForCompaction(int level) const {
   assert(level >= 0);
   assert(level < num_levels_);
 
-  if (!IsTiered()) {
+  if (!IsSortedRunStyle()) {
     return 0;
   }
 
@@ -3900,6 +4031,9 @@ int VersionStorageInfo::MaxInputLevel() const {
   if (compaction_style_ == kCompactionStyleLevel ||
       compaction_style_ == kCompactionStyleTiered) {
     return num_levels() - 2;
+  }
+  if (compaction_style_ == kCompactionStyleUDP) {
+    return num_levels() - 1;
   }
   return 0;
 }
@@ -4104,6 +4238,29 @@ void VersionStorageInfo::ComputeCompactionScore(
           compaction_level_[j] = level;
         }
       }
+    }
+    ComputeFilesMarkedForCompaction(max_output_level);
+    ComputeBottommostFilesMarkedForCompaction(
+        immutable_options.cf_allow_ingest_behind ||
+            immutable_options.allow_ingest_behind,
+        immutable_options.user_comparator, full_history_ts_low);
+    ComputeExpiredTtlFiles(immutable_options, mutable_cf_options.ttl);
+    ComputeFilesMarkedForPeriodicCompaction(
+        immutable_options, mutable_cf_options.periodic_compaction_seconds,
+        max_output_level);
+    ComputeFilesMarkedForForcedBlobGC(
+        mutable_cf_options.blob_garbage_collection_age_cutoff,
+        mutable_cf_options.blob_garbage_collection_force_threshold,
+        mutable_cf_options.enable_blob_garbage_collection);
+    ComputeFilesMarkedForReadTriggeredCompaction(
+        mutable_cf_options.read_triggered_compaction_threshold,
+        immutable_options.compaction_style);
+    return;
+  }
+  if (IsUDP()) {
+    for (int level = 0; level < num_levels(); ++level) {
+      compaction_level_[level] = level;
+      compaction_score_[level] = 0.0;
     }
     ComputeFilesMarkedForCompaction(max_output_level);
     ComputeBottommostFilesMarkedForCompaction(
@@ -4841,7 +4998,8 @@ void VersionStorageInfo::UpdateFilesByCompactionPri(
   if (compaction_style_ == kCompactionStyleNone ||
       compaction_style_ == kCompactionStyleFIFO ||
       compaction_style_ == kCompactionStyleUniversal ||
-      compaction_style_ == kCompactionStyleTiered) {
+      compaction_style_ == kCompactionStyleTiered ||
+      compaction_style_ == kCompactionStyleUDP) {
     // don't need this
     return;
   }
@@ -5095,7 +5253,7 @@ bool VersionStorageInfo::OverlapInLevel(int level,
     // empty level, no overlap
     return false;
   }
-  if (IsTiered() && level > 0) {
+  if (IsSortedRunStyle() && level > 0) {
     const auto& level_runs = LevelSortedRuns(level);
     for (const auto& run : level_runs.runs) {
       if (SomeFileOverlapsRange(*internal_comparator_, /*disjoint=*/true,
@@ -5130,7 +5288,7 @@ void VersionStorageInfo::GetOverlappingInputs(
     *file_index = -1;
   }
   const Comparator* user_cmp = user_comparator_;
-  if (IsTiered() && level > 0) {
+  if (IsSortedRunStyle() && level > 0) {
     if (next_smallest) {
       *next_smallest = nullptr;
     }
@@ -5754,8 +5912,8 @@ uint64_t VersionStorageInfo::EstimateLiveDataSize() const {
 bool VersionStorageInfo::RangeMightExistAfterSortedRun(
     const Slice& smallest_user_key, const Slice& largest_user_key,
     int last_level, int last_l0_idx) {
-  if (IsTiered()) {
-    // Tiered levels may have overlapping runs in the same level, so the
+  if (IsSortedRunStyle()) {
+    // Sorted-run levels may have overlapping runs in the same level, so the
     // leveled "sorted run after this file" reasoning does not apply.
     // Be conservative until tiered compaction/bottommost logic is added.
     return true;
@@ -7857,7 +8015,7 @@ uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
     return 0;
   }
 
-  if (vstorage->IsTiered()) {
+  if (vstorage->IsSortedRunStyle()) {
     uint64_t total_size = 0;
     for (int level = start_level; level < end_level; ++level) {
       for (const auto* file_meta : vstorage->LevelFiles(level)) {
@@ -8164,15 +8322,17 @@ InternalIterator* VersionSet::MakeInputIterator(
     const std::optional<const Slice>& start,
     const std::optional<const Slice>& end) {
   auto cfd = c->column_family_data();
-  const bool use_tiered_run_iters =
-      cfd->ioptions().compaction_style == kCompactionStyleTiered &&
-      c->num_input_levels() == 1 && c->level() > 0;
+  const bool use_sorted_run_iters =
+      (cfd->ioptions().compaction_style == kCompactionStyleTiered ||
+       cfd->ioptions().compaction_style == kCompactionStyleUDP);
   // Level-0 files have to be merged together.  For other levels,
   // we will make a concatenating iterator per level.
   // TODO(opt): use concatenating iterator for level-0 if there is no overlap
   size_t space = 0;
-  if (use_tiered_run_iters) {
-    space = c->num_input_files(0);
+  if (use_sorted_run_iters) {
+    for (size_t which = 0; which < c->num_input_levels(); ++which) {
+      space += c->num_input_files(which);
+    }
   } else {
     space = (c->level() == 0 ? c->input_levels(0)->num_files +
                                    c->num_input_levels() - 1
@@ -8189,21 +8349,17 @@ InternalIterator* VersionSet::MakeInputIterator(
       range_tombstones;
   size_t num = 0;
   [[maybe_unused]] size_t num_input_files = 0;
-  if (use_tiered_run_iters) {
-    const int level = c->level();
-    std::vector<FileMetaData*> run_files;
-    uint64_t current_run_id = 0;
-    bool has_current_run = false;
-    auto flush_run = [&]() {
-      if (run_files.empty()) {
+  if (use_sorted_run_iters) {
+    auto add_run = [&](int level, std::vector<FileMetaData*>* run_files) {
+      if (run_files->empty()) {
         return;
       }
-      num_input_files += run_files.size();
-      if (run_files.size() == 1) {
+      num_input_files += run_files->size();
+      if (run_files->size() == 1) {
         std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;
         auto table_iter = cfd->table_cache()->NewIterator(
             read_options, file_options_compactions, cfd->internal_comparator(),
-            *run_files[0], range_del_agg, c->mutable_cf_options(), nullptr,
+            *(*run_files)[0], range_del_agg, c->mutable_cf_options(), nullptr,
             /* no per level latency histogram=*/nullptr,
             TableReaderCaller::kCompaction,
             /*arena=*/nullptr,
@@ -8220,13 +8376,13 @@ InternalIterator* VersionSet::MakeInputIterator(
           list[num++] = table_iter;
           range_tombstones.emplace_back(std::move(tombstone_iter), nullptr);
         }
-        run_files.clear();
+        run_files->clear();
         return;
       }
 
       auto* run_arena = new Arena();
       auto* run_brief = new LevelFilesBrief();
-      DoGenerateLevelFilesBrief(run_brief, run_files, run_arena);
+      DoGenerateLevelFilesBrief(run_brief, *run_files, run_arena);
       std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr =
           nullptr;
       list[num++] = new LevelIterator(
@@ -8241,75 +8397,89 @@ InternalIterator* VersionSet::MakeInputIterator(
       list[num - 1]->RegisterCleanup(&CleanupLevelFilesBriefArena, run_arena,
                                      run_brief);
       range_tombstones.emplace_back(nullptr, tombstone_iter_ptr);
-      run_files.clear();
+      run_files->clear();
     };
 
-    for (FileMetaData* file : *c->inputs(0)) {
-      if (!has_current_run || file->sorted_run_id != current_run_id) {
-        flush_run();
-        current_run_id = file->sorted_run_id;
-        has_current_run = true;
-      }
-      run_files.push_back(file);
-    }
-    flush_run();
-  } else {
-  for (size_t which = 0; which < c->num_input_levels(); which++) {
-    const LevelFilesBrief* flevel = c->input_levels(which);
-    num_input_files += flevel->num_files;
-    if (flevel->num_files != 0) {
-      if (c->level(which) == 0) {
-        for (size_t i = 0; i < flevel->num_files; i++) {
-          const FileMetaData& fmd = *flevel->files[i].file_metadata;
-          if (start.has_value() &&
-              cfd->user_comparator()->CompareWithoutTimestamp(
-                  *start, fmd.largest.user_key()) > 0) {
-            continue;
-          }
-          // We should be able to filter out the case where the end key
-          // equals to the end boundary, since the end key is exclusive.
-          // We try to be extra safe here.
-          if (end.has_value() &&
-              cfd->user_comparator()->CompareWithoutTimestamp(
-                  *end, fmd.smallest.user_key()) < 0) {
-            continue;
-          }
-          std::unique_ptr<TruncatedRangeDelIterator> range_tombstone_iter =
-              nullptr;
-          list[num++] = cfd->table_cache()->NewIterator(
-              read_options, file_options_compactions,
-              cfd->internal_comparator(), fmd, range_del_agg,
-              c->mutable_cf_options(),
-              /*table_reader_ptr=*/nullptr,
-              /*file_read_hist=*/nullptr, TableReaderCaller::kCompaction,
-              /*arena=*/nullptr,
-              /*skip_filters=*/false,
-              /*level=*/static_cast<int>(c->level(which)),
-              MaxFileSizeForL0MetaPin(c->mutable_cf_options()),
-              /*smallest_compaction_key=*/nullptr,
-              /*largest_compaction_key=*/nullptr,
-              /*allow_unprepared_value=*/false,
-              /*range_del_read_seqno=*/nullptr,
-              /*range_del_iter=*/&range_tombstone_iter);
-          range_tombstones.emplace_back(std::move(range_tombstone_iter),
-                                        nullptr);
+    for (size_t which = 0; which < c->num_input_levels(); ++which) {
+      const int level = c->level(which);
+      if (level == 0) {
+        for (FileMetaData* file : *c->inputs(which)) {
+          std::vector<FileMetaData*> single_file_run{file};
+          add_run(level, &single_file_run);
         }
-      } else {
-        // Create concatenating iterator for the files from this level
-        std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr =
-            nullptr;
-        list[num++] = new LevelIterator(
-            cfd->table_cache(), read_options, file_options_compactions,
-            cfd->internal_comparator(), flevel, c->mutable_cf_options(),
-            /*no per level latency histogram=*/nullptr,
-            TableReaderCaller::kCompaction, /*skip_filters=*/false,
-            /*level=*/static_cast<int>(c->level(which)), range_del_agg,
-            c->boundaries(which), false, &tombstone_iter_ptr,
-            db_options_->statistics.get(), clock_);
-        range_tombstones.emplace_back(nullptr, tombstone_iter_ptr);
+        continue;
+      }
+
+      std::vector<FileMetaData*> run_files;
+      uint64_t current_run_id = 0;
+      bool has_current_run = false;
+      for (FileMetaData* file : *c->inputs(which)) {
+        if (!has_current_run || file->sorted_run_id != current_run_id) {
+          add_run(level, &run_files);
+          current_run_id = file->sorted_run_id;
+          has_current_run = true;
+        }
+        run_files.push_back(file);
+      }
+      add_run(level, &run_files);
+    }
+  } else {
+    for (size_t which = 0; which < c->num_input_levels(); which++) {
+      const LevelFilesBrief* flevel = c->input_levels(which);
+      num_input_files += flevel->num_files;
+      if (flevel->num_files != 0) {
+        if (c->level(which) == 0) {
+          for (size_t i = 0; i < flevel->num_files; i++) {
+            const FileMetaData& fmd = *flevel->files[i].file_metadata;
+            if (start.has_value() &&
+                cfd->user_comparator()->CompareWithoutTimestamp(
+                    *start, fmd.largest.user_key()) > 0) {
+              continue;
+            }
+            // We should be able to filter out the case where the end key
+            // equals to the end boundary, since the end key is exclusive.
+            // We try to be extra safe here.
+            if (end.has_value() &&
+                cfd->user_comparator()->CompareWithoutTimestamp(
+                    *end, fmd.smallest.user_key()) < 0) {
+              continue;
+            }
+            std::unique_ptr<TruncatedRangeDelIterator> range_tombstone_iter =
+                nullptr;
+            list[num++] = cfd->table_cache()->NewIterator(
+                read_options, file_options_compactions,
+                cfd->internal_comparator(), fmd, range_del_agg,
+                c->mutable_cf_options(),
+                /*table_reader_ptr=*/nullptr,
+                /*file_read_hist=*/nullptr, TableReaderCaller::kCompaction,
+                /*arena=*/nullptr,
+                /*skip_filters=*/false,
+                /*level=*/static_cast<int>(c->level(which)),
+                MaxFileSizeForL0MetaPin(c->mutable_cf_options()),
+                /*smallest_compaction_key=*/nullptr,
+                /*largest_compaction_key=*/nullptr,
+                /*allow_unprepared_value=*/false,
+                /*range_del_read_seqno=*/nullptr,
+                /*range_del_iter=*/&range_tombstone_iter);
+            range_tombstones.emplace_back(std::move(range_tombstone_iter),
+                                          nullptr);
+          }
+        } else {
+          // Create concatenating iterator for the files from this level
+          std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr =
+              nullptr;
+          list[num++] = new LevelIterator(
+              cfd->table_cache(), read_options, file_options_compactions,
+              cfd->internal_comparator(), flevel, c->mutable_cf_options(),
+              /*no per level latency histogram=*/nullptr,
+              TableReaderCaller::kCompaction, /*skip_filters=*/false,
+              /*level=*/static_cast<int>(c->level(which)), range_del_agg,
+              c->boundaries(which), false, &tombstone_iter_ptr,
+              db_options_->statistics.get(), clock_);
+          range_tombstones.emplace_back(nullptr, tombstone_iter_ptr);
+        }
       }
     }
-  }
   }
   TEST_SYNC_POINT_CALLBACK(
       "VersionSet::MakeInputIterator:NewCompactionMergingIterator",

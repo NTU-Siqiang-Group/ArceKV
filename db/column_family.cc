@@ -24,6 +24,7 @@
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_tiered.h"
+#include "db/compaction/compaction_picker_udp.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/db_impl/db_impl.h"
 #include "db/internal_stats.h"
@@ -210,7 +211,8 @@ Status CheckCFPathsSupported(const DBOptions& db_options,
   // being used.
   if ((cf_options.compaction_style != kCompactionStyleUniversal) &&
       (cf_options.compaction_style != kCompactionStyleLevel) &&
-      (cf_options.compaction_style != kCompactionStyleTiered)) {
+      (cf_options.compaction_style != kCompactionStyleTiered) &&
+      (cf_options.compaction_style != kCompactionStyleUDP)) {
     if (cf_options.cf_paths.size() > 1) {
       return Status::NotSupported(
           "More than one CF paths are only supported in "
@@ -279,7 +281,8 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
     result.num_levels = 1;
   }
   if ((result.compaction_style == kCompactionStyleLevel ||
-       result.compaction_style == kCompactionStyleTiered) &&
+       result.compaction_style == kCompactionStyleTiered ||
+       result.compaction_style == kCompactionStyleUDP) &&
       result.num_levels < 2) {
     result.num_levels = 2;
   }
@@ -688,6 +691,9 @@ ColumnFamilyData::ColumnFamilyData(
     } else if (ioptions_.compaction_style == kCompactionStyleTiered) {
       compaction_picker_.reset(
           new TieredCompactionPicker(ioptions_, &internal_comparator_));
+    } else if (ioptions_.compaction_style == kCompactionStyleUDP) {
+      compaction_picker_.reset(
+          new UDPCompactionPicker(ioptions_, &internal_comparator_));
     } else if (ioptions_.compaction_style == kCompactionStyleUniversal) {
       compaction_picker_.reset(
           new UniversalCompactionPicker(ioptions_, &internal_comparator_));

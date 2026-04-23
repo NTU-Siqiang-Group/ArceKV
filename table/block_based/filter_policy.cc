@@ -1852,6 +1852,7 @@ FilterBitsBuilder* RibbonFilterPolicy::GetBuilderWithContext(
     switch (context.compaction_style) {
       case kCompactionStyleLevel:
       case kCompactionStyleTiered:
+      case kCompactionStyleUDP:
       case kCompactionStyleUniversal: {
         if (context.reason == TableFileCreationReason::kFlush) {
           // Treat flush as level -1

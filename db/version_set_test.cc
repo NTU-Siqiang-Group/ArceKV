@@ -1685,6 +1685,8 @@ class TieredVersionReadTest : public VersionSetTest {
     cf_options_.compaction_style = kCompactionStyleTiered;
   }
 
+  void EnableUDPReads() { cf_options_.compaction_style = kCompactionStyleUDP; }
+
   FileMetaData CreateMockFile(const MockFileSpec& spec) {
     EXPECT_FALSE(spec.entries.empty());
 
@@ -1989,6 +1991,42 @@ TEST_F(TieredVersionReadTest, LargerMultiLevelTieredReadsRemainOrdered) {
       {"k03", "l1r20-k03"}, {"k04", "l2r06-k04"}, {"k05", "l1r10-k05"},
       {"k06", "l1r20-k06"}, {"k07", "l2r05-k07"}, {"k08", "l2r06-k08"},
       {"k09", "l3r01-k09"},
+  };
+  ASSERT_EQ(expected, ScanCurrentVersion());
+}
+
+TEST_F(TieredVersionReadTest, UDPGetIgnoresSortedRunIdRecencyOrder) {
+  EnableUDPReads();
+  NewDB();
+
+  InstallMockFiles({
+      MockFileSpec{150, 1, 100, {{"k", 20, "old-high-run-id"},
+                                 {"z", 20, "z-old"}}},
+      MockFileSpec{151, 1, 10, {{"a", 30, "a-new"},
+                                {"k", 30, "new-low-run-id"}}},
+      MockFileSpec{152, 2, 200, {{"k", 10, "older-l2"}}},
+  });
+
+  ASSERT_EQ("new-low-run-id", GetFromCurrentVersion("k"));
+}
+
+TEST_F(TieredVersionReadTest, UDPIteratorMergesUnorderedOverlappingRuns) {
+  EnableUDPReads();
+  NewDB();
+
+  InstallMockFiles({
+      MockFileSpec{160, 1, 100, {{"a", 20, "a-old"},
+                                 {"c", 20, "c-old"}}},
+      MockFileSpec{161, 1, 10, {{"a", 30, "a-new"},
+                                {"b", 30, "b-new"}}},
+      MockFileSpec{162, 2, 200, {{"d", 10, "d-older"}}},
+  });
+
+  std::vector<std::pair<std::string, std::string>> expected = {
+      {"a", "a-new"},
+      {"b", "b-new"},
+      {"c", "c-old"},
+      {"d", "d-older"},
   };
   ASSERT_EQ(expected, ScanCurrentVersion());
 }
