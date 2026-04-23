@@ -21,15 +21,15 @@ The driver:
 
 ## Files Added Or Changed
 
-- [examples/tiered_compaction_integration.cc](/home/junfeng/agentkv/examples/tiered_compaction_integration.cc)
+- [examples/tiered_compaction_integration.cc](examples/tiered_compaction_integration.cc)
   Standalone integration driver.
-- [examples/CMakeLists.txt](/home/junfeng/agentkv/examples/CMakeLists.txt)
+- [examples/CMakeLists.txt](examples/CMakeLists.txt)
   Adds a CMake target for the driver.
-- [examples/Makefile](/home/junfeng/agentkv/examples/Makefile)
+- [examples/Makefile](examples/Makefile)
   Adds a Makefile target for the driver.
-- [include/rocksdb/metadata.h](/home/junfeng/agentkv/include/rocksdb/metadata.h)
+- [include/rocksdb/metadata.h](include/rocksdb/metadata.h)
   Exposes `sorted_run_id` through `LiveFileMetaData`.
-- [db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc)
+- [db/version_set.cc](db/version_set.cc)
   Populates `LiveFileMetaData.sorted_run_id`.
 
 ## Public API Issue Fixed

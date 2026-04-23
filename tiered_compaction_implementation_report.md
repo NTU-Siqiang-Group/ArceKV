@@ -21,15 +21,15 @@ The current policy has these defining rules:
 
 The main implementation points are in:
 
-- [db/version_set.h](/home/junfeng/agentkv/db/version_set.h)
-- [db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc)
-- [db/compaction/compaction_picker_tiered.h](/home/junfeng/agentkv/db/compaction/compaction_picker_tiered.h)
-- [db/compaction/compaction_picker_tiered.cc](/home/junfeng/agentkv/db/compaction/compaction_picker_tiered.cc)
-- [db/compaction/compaction.cc](/home/junfeng/agentkv/db/compaction/compaction.cc)
-- [db/compaction/compaction_job.cc](/home/junfeng/agentkv/db/compaction/compaction_job.cc)
-- [db/db_impl/db_impl_compaction_flush.cc](/home/junfeng/agentkv/db/db_impl/db_impl_compaction_flush.cc)
-- [db/version_edit.h](/home/junfeng/agentkv/db/version_edit.h)
-- [db/version_edit.cc](/home/junfeng/agentkv/db/version_edit.cc)
+- [db/version_set.h](db/version_set.h)
+- [db/version_set.cc](db/version_set.cc)
+- [db/compaction/compaction_picker_tiered.h](db/compaction/compaction_picker_tiered.h)
+- [db/compaction/compaction_picker_tiered.cc](db/compaction/compaction_picker_tiered.cc)
+- [db/compaction/compaction.cc](db/compaction/compaction.cc)
+- [db/compaction/compaction_job.cc](db/compaction/compaction_job.cc)
+- [db/db_impl/db_impl_compaction_flush.cc](db/db_impl/db_impl_compaction_flush.cc)
+- [db/version_edit.h](db/version_edit.h)
+- [db/version_edit.cc](db/version_edit.cc)
 
 ## 1. Tree Structure
 
@@ -64,12 +64,12 @@ tiered structure is materialized as a derived view over the files in a level.
 
 The main data types are:
 
-- `LevelSortedRunBrief` in [db/version_set.h](/home/junfeng/agentkv/db/version_set.h)
-- `LevelSortedRunsBrief` in [db/version_set.h](/home/junfeng/agentkv/db/version_set.h)
+- `LevelSortedRunBrief` in [db/version_set.h](db/version_set.h)
+- `LevelSortedRunsBrief` in [db/version_set.h](db/version_set.h)
 - `sorted_run_id` added to `FileMetaData` and persisted in version edits
 
 The derived run layout is built in
-[db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc:3653) by
+[db/version_set.cc](db/version_set.cc:3653) by
 `VersionStorageInfo::GenerateLevelSortedRunsBrief()`.
 
 That function:
@@ -94,13 +94,13 @@ This value is:
 Relevant code:
 
 - manifest field definition:
-  [db/version_edit.h](/home/junfeng/agentkv/db/version_edit.h)
+  [db/version_edit.h](db/version_edit.h)
 - manifest encode/decode:
-  [db/version_edit.cc](/home/junfeng/agentkv/db/version_edit.cc:347)
+  [db/version_edit.cc](db/version_edit.cc:347)
 - public metadata exposure:
-  [include/rocksdb/metadata.h](/home/junfeng/agentkv/include/rocksdb/metadata.h:171)
+  [include/rocksdb/metadata.h](include/rocksdb/metadata.h:171)
 - live metadata population:
-  [db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc:8349)
+  [db/version_set.cc](db/version_set.cc:8349)
 
 ## 2. Consistent Reads
 
@@ -117,7 +117,7 @@ The tiered implementation is intentionally isolated from the leveled read path
 using explicit branching rather than rewriting the shared path globally.
 
 The main branch points are in
-[db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc):
+[db/version_set.cc](db/version_set.cc):
 
 - point lookup selection via `TieredFilePicker`
 - iterator construction via `AddTieredIteratorsForLevel()`
@@ -128,7 +128,7 @@ This keeps the original leveled logic intact when
 ### 2.2 Point lookup path
 
 For point lookups, the tiered path is implemented by `TieredFilePicker` in
-[db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc:355).
+[db/version_set.cc](db/version_set.cc:355).
 
 The logic is:
 
@@ -173,8 +173,8 @@ When overlapping runs exist in one level:
 
 The tiered tests that validate this include:
 
-- [db/version_set_test.cc](/home/junfeng/agentkv/db/version_set_test.cc:1858)
-- [db/version_set_test.cc](/home/junfeng/agentkv/db/version_set_test.cc:1963)
+- [db/version_set_test.cc](db/version_set_test.cc:1858)
+- [db/version_set_test.cc](db/version_set_test.cc:1963)
 
 ### 2.4 Iterator design
 
@@ -183,9 +183,9 @@ Range lookup and full iteration cannot assume one run per level either.
 The tiered iterator path is:
 
 - `Version::AddTieredIteratorsForLevel()` for user iteration:
-  [db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc:2558)
+  [db/version_set.cc](db/version_set.cc:2558)
 - `VersionSet::MakeInputIterator()` for compaction input iteration:
-  [db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc:8160)
+  [db/version_set.cc](db/version_set.cc:8160)
 
 For user iterators:
 
@@ -218,15 +218,15 @@ selected only some runs.
 
 Tiered iterator tests include:
 
-- [db/version_set_test.cc](/home/junfeng/agentkv/db/version_set_test.cc:1893)
-- [db/version_set_test.cc](/home/junfeng/agentkv/db/version_set_test.cc:1918)
+- [db/version_set_test.cc](db/version_set_test.cc:1893)
+- [db/version_set_test.cc](db/version_set_test.cc:1918)
 
 ## 3. Compaction
 
 ### 3.1 Trigger condition and scoring
 
 Tiered compaction scoring is implemented in
-[db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc:4073) inside
+[db/version_set.cc](db/version_set.cc:4073) inside
 `VersionStorageInfo::ComputeCompactionScore()`.
 
 For tiered style, score is based on run count, not bytes:
@@ -243,7 +243,7 @@ That means:
 - levels with higher run-count pressure rank higher
 
 `NumTieredRunsForCompaction()` is in
-[db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc:3692).
+[db/version_set.cc](db/version_set.cc:3692).
 
 Behavior:
 
@@ -255,7 +255,7 @@ Behavior:
 ### 3.2 Picking inputs
 
 Automatic tiered picking is implemented in
-[db/compaction/compaction_picker_tiered.cc](/home/junfeng/agentkv/db/compaction/compaction_picker_tiered.cc:171).
+[db/compaction/compaction_picker_tiered.cc](db/compaction/compaction_picker_tiered.cc:171).
 
 Current automatic policy:
 
@@ -281,7 +281,7 @@ into one oversized run.
 Manual compaction is separate:
 
 - `PickCompactionForCompactRange()` in
-  [db/compaction/compaction_picker_tiered.cc](/home/junfeng/agentkv/db/compaction/compaction_picker_tiered.cc:108)
+  [db/compaction/compaction_picker_tiered.cc](db/compaction/compaction_picker_tiered.cc:108)
 - for tiered manual compaction, if the requested range overlaps a level, the
   implementation picks the whole level
 
@@ -300,7 +300,7 @@ Once a compaction is picked:
   `output_sorted_run_id`
 
 The run ID assignment is created in
-[db/compaction/compaction.cc](/home/junfeng/agentkv/db/compaction/compaction.cc:68)
+[db/compaction/compaction.cc](db/compaction/compaction.cc:68)
 inside `Compaction::FinalizeInputInfo()`.
 
 For tiered compaction:
@@ -310,7 +310,7 @@ For tiered compaction:
 
 Then, during output file installation, every file produced by that compaction
 inherits that same run ID in
-[db/compaction/compaction_job.cc](/home/junfeng/agentkv/db/compaction/compaction_job.cc:2500).
+[db/compaction/compaction_job.cc](db/compaction/compaction_job.cc:2500).
 
 That is how multiple output SSTs from one compaction become one new sorted run.
 
@@ -333,7 +333,7 @@ non-L0 level is one globally ordered file chain. That is not true for tiered
 levels with multiple runs.
 
 To avoid corrupt assumptions, boundary helpers in
-[db/compaction/compaction.cc](/home/junfeng/agentkv/db/compaction/compaction.cc:81)
+[db/compaction/compaction.cc](db/compaction/compaction.cc:81)
 were updated so that for tiered compactions they scan every input file when
 computing smallest/largest boundaries, rather than relying on just the first
 and last file of the level.
@@ -352,8 +352,8 @@ For each new SST file, the manifest entry now includes:
 
 This is handled by:
 
-- encode in [db/version_edit.cc](/home/junfeng/agentkv/db/version_edit.cc:347)
-- decode in [db/version_edit.cc](/home/junfeng/agentkv/db/version_edit.cc:504)
+- encode in [db/version_edit.cc](db/version_edit.cc:347)
+- decode in [db/version_edit.cc](db/version_edit.cc:504)
 
 ### 4.2 How reopen reconstructs runs
 
@@ -377,7 +377,7 @@ This is one of the main reasons the manifest change is central to the design:
 The system must also avoid reusing run IDs after reopen.
 
 That is handled in
-[db/version_set.cc](/home/junfeng/agentkv/db/version_set.cc:7158).
+[db/version_set.cc](db/version_set.cc:7158).
 
 During recovery:
 
@@ -388,7 +388,7 @@ During recovery:
 Fresh run IDs are then allocated by:
 
 - `VersionSet::NewSortedRunId()` in
-  [db/version_set.h](/home/junfeng/agentkv/db/version_set.h:1459)
+  [db/version_set.h](db/version_set.h:1459)
 
 This guarantees that every future compaction-generated run gets a distinct
 monotonically increasing ID.
@@ -399,7 +399,7 @@ The public metadata surface was also updated so that tools can reconstruct the
 same run layout after reopen using `GetLiveFilesMetaData()`.
 
 That is why `LiveFileMetaData` now exposes `sorted_run_id` in
-[include/rocksdb/metadata.h](/home/junfeng/agentkv/include/rocksdb/metadata.h:171).
+[include/rocksdb/metadata.h](include/rocksdb/metadata.h:171).
 
 The standalone integration tool uses exactly that API to reconstruct and print
 the tiered tree.

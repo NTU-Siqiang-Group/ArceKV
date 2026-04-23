@@ -106,4 +106,7 @@ third-party/folly/
 # Claude Code local settings
 .claude/settings.local.json
 
+# Codex local marker
+.codex
+
 tools/__pycache__/
