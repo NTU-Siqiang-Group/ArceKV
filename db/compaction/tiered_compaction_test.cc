@@ -31,6 +31,7 @@ ConfigOptions GetStrictConfigOptions() {
   config_options.input_strings_escaped = false;
   return config_options;
 }
+
 }  // namespace
 
 class TieredCompactionTest : public DBTestBase {

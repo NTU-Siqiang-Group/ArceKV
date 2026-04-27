@@ -49,3 +49,9 @@ add_executable(tiered_compaction_integration
   tiered_compaction_integration.cc)
 target_link_libraries(tiered_compaction_integration
   ${ROCKSDB_LIB})
+
+add_executable(udp_compaction_integration
+  EXCLUDE_FROM_ALL
+  udp_compaction_integration.cc)
+target_link_libraries(udp_compaction_integration
+  ${ROCKSDB_LIB})

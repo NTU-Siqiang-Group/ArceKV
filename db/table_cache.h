@@ -120,6 +120,18 @@ class TableCache {
              HistogramImpl* file_read_hist = nullptr, bool skip_filters = false,
              int level = -1, size_t max_file_size_for_l0_meta_pin = 0);
 
+  // Checks table filters without reading data blocks. Returns may_match=false
+  // only when the table filter proves the key is absent. If the table format
+  // has no filter-only implementation, may_match remains true.
+  Status KeyMayMatch(const ReadOptions& options,
+                     const InternalKeyComparator& internal_comparator,
+                     const FileMetaData& file_meta, const Slice& k,
+                     GetContext* get_context,
+                     const MutableCFOptions& mutable_cf_options,
+                     bool* may_match, HistogramImpl* file_read_hist = nullptr,
+                     int level = -1,
+                     size_t max_file_size_for_l0_meta_pin = 0);
+
   // Return the range delete tombstone iterator of the file specified by
   // `file_meta`.
   Status GetRangeTombstoneIterator(

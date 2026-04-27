@@ -1168,6 +1168,12 @@ class Version {
                             const LevelFilesBrief& run_files,
                             bool allow_unprepared_value);
 
+  void GetFromUDP(const ReadOptions& read_options, const Slice& ikey,
+                  const Slice& user_key, GetContext* get_context,
+                  bool* is_blob_index, bool do_merge, PinnableSlice* value,
+                  PinnableWideColumns* columns, Status* status,
+                  MergeContext* merge_context, bool* key_exists);
+
   // The helper function of UpdateAccumulatedStats, which may fill the missing
   // fields of file_meta from its associated TableProperties.
   // Returns true if it does initialize FileMetaData.

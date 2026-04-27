@@ -2486,6 +2486,44 @@ bool BlockBasedTable::TimestampMayMatch(const ReadOptions& read_options) const {
   return true;
 }
 
+Status BlockBasedTable::KeyMayMatch(const ReadOptions& read_options,
+                                    const Slice& key,
+                                    GetContext* get_context,
+                                    const SliceTransform* prefix_extractor,
+                                    bool* may_match) {
+  assert(may_match != nullptr);
+  *may_match = true;
+
+  if (!TimestampMayMatch(read_options)) {
+    *may_match = false;
+    return Status::OK();
+  }
+
+  assert(key.size() >= 8);
+  FilterBlockReader* const filter = rep_->filter.get();
+  if (filter == nullptr) {
+    return Status::OK();
+  }
+
+  const uint64_t tracing_get_id =
+      get_context == nullptr ? BlockCacheTraceHelper::kReservedGetId
+                             : get_context->get_tracing_get_id();
+  BlockCacheLookupContext lookup_context{
+      TableReaderCaller::kUserGet, tracing_get_id,
+      /*get_from_user_specified_snapshot=*/read_options.snapshot != nullptr};
+  if (block_cache_tracer_ && block_cache_tracer_->is_tracing_enabled()) {
+    lookup_context.referenced_key = key.ToString();
+    lookup_context.get_from_user_specified_snapshot =
+        read_options.snapshot != nullptr;
+  }
+
+  TEST_SYNC_POINT("BlockBasedTable::KeyMayMatch:BeforeFilterMatch");
+  *may_match = FullFilterKeyMayMatch(filter, key, prefix_extractor, get_context,
+                                     &lookup_context, read_options);
+  TEST_SYNC_POINT("BlockBasedTable::KeyMayMatch:AfterFilterMatch");
+  return Status::OK();
+}
+
 Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
                             GetContext* get_context,
                             const SliceTransform* prefix_extractor,

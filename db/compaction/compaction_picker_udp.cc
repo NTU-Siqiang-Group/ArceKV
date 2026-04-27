@@ -27,6 +27,24 @@ uint32_t NewRandomSeed() {
   return Random::GetTLSInstance()->Next();
 }
 
+size_t CountUDPSortedRuns(const VersionStorageInfo* vstorage) {
+  size_t total_runs = 0;
+  for (int level = 0; level < vstorage->num_levels(); ++level) {
+    const size_t num_files = vstorage->NumLevelFiles(level);
+    if (num_files == 0) {
+      continue;
+    }
+    if (level == 0) {
+      total_runs += num_files;
+    } else {
+      total_runs += vstorage->NumSortedRuns(level);
+    }
+    if (total_runs > 1) {
+      return total_runs;
+    }
+  }
+  return total_runs;
+}
 bool LevelAvailable(const VersionStorageInfo* vstorage, int level) {
   for (const auto* file : vstorage->LevelFiles(level)) {
     if (file->being_compacted) {
@@ -46,13 +64,15 @@ void AppendRunFiles(const SortedRunBrief& run,
 std::vector<FileMetaData*> SelectUDPRandomInputRuns(
     VersionStorageInfo* vstorage, int level, Random* rnd) {
   std::vector<FileMetaData*> selected_files;
+  if (vstorage->NumLevelFiles(level) == 0) {
+    return selected_files;
+  }
   if (level == 0) {
     const auto& level_files = vstorage->LevelFiles(level);
     if (level_files.empty()) {
       return selected_files;
     }
-    const size_t files_to_take = rnd->Uniform(
-        static_cast<int>(level_files.size())) + 1;
+    const size_t files_to_take = std::min<size_t>(2, level_files.size());
     std::vector<size_t> indexes;
     indexes.reserve(level_files.size());
     for (size_t i = 0; i < level_files.size(); ++i) {
@@ -69,8 +89,7 @@ std::vector<FileMetaData*> SelectUDPRandomInputRuns(
   if (level_runs.num_runs() == 0) {
     return selected_files;
   }
-  const size_t runs_to_take =
-      rnd->Uniform(static_cast<int>(level_runs.num_runs())) + 1;
+  const size_t runs_to_take = std::min<size_t>(2, level_runs.num_runs());
   std::vector<size_t> indexes;
   indexes.reserve(level_runs.num_runs());
   for (size_t i = 0; i < level_runs.num_runs(); ++i) {
@@ -84,11 +103,10 @@ std::vector<FileMetaData*> SelectUDPRandomInputRuns(
 }
 
 std::vector<FileMetaData*> SelectUDPRandomOutputRun(
-    VersionStorageInfo* vstorage, int level, Random* rnd,
-    uint64_t* selected_sorted_run_id) {
+    VersionStorageInfo* vstorage, int level, Random* rnd) {
   std::vector<FileMetaData*> selected_files;
   if (level <= 0 || level >= vstorage->num_levels() ||
-      !LevelAvailable(vstorage, level)) {
+      vstorage->NumLevelFiles(level) == 0 || !LevelAvailable(vstorage, level)) {
     return selected_files;
   }
   const auto& level_runs = vstorage->LevelSortedRuns(level);
@@ -96,7 +114,6 @@ std::vector<FileMetaData*> SelectUDPRandomOutputRun(
     return selected_files;
   }
   const size_t run_index = rnd->Uniform(static_cast<int>(level_runs.num_runs()));
-  *selected_sorted_run_id = level_runs.runs[run_index].sorted_run_id;
   AppendRunFiles(level_runs.runs[run_index], &selected_files);
   return selected_files;
 }
@@ -104,8 +121,9 @@ std::vector<FileMetaData*> SelectUDPRandomOutputRun(
 }  // namespace
 
 bool UDPCompactionPicker::NeedsCompaction(
-    const VersionStorageInfo* /*vstorage*/) const {
-  return true;
+    const VersionStorageInfo* vstorage) const {
+  assert(vstorage->IsUDP());
+  return CountUDPSortedRuns(vstorage) > 1;
 }
 
 Compaction* UDPCompactionPicker::PickCompaction(
@@ -148,11 +166,9 @@ Compaction* UDPCompactionPicker::PickCompaction(
   std::vector<CompactionInputFiles> compaction_inputs;
   compaction_inputs.push_back(std::move(start_level_inputs));
 
-  uint64_t selected_output_sorted_run_id = 0;
   if (output_level != start_level) {
     std::vector<FileMetaData*> output_run_files =
-        SelectUDPRandomOutputRun(vstorage, output_level, &rnd,
-                                 &selected_output_sorted_run_id);
+        SelectUDPRandomOutputRun(vstorage, output_level, &rnd);
     if (!output_run_files.empty()) {
       CompactionInputFiles output_level_inputs;
       output_level_inputs.level = output_level;
@@ -178,10 +194,6 @@ Compaction* UDPCompactionPicker::PickCompaction(
       /*snapshot_checker=*/nullptr, CompactionReason::kLevelMaxLevelSize,
       /*trim_ts=*/"", /*score=*/0,
       /*l0_files_might_overlap=*/true);
-
-  if (selected_output_sorted_run_id != 0) {
-    c->set_preselected_output_sorted_run_id(selected_output_sorted_run_id);
-  }
 
   RegisterCompaction(c);
   return c;

@@ -557,6 +557,41 @@ Status TableCache::Get(const ReadOptions& options,
   return s;
 }
 
+Status TableCache::KeyMayMatch(
+    const ReadOptions& options, const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, const Slice& k, GetContext* get_context,
+    const MutableCFOptions& mutable_cf_options, bool* may_match,
+    HistogramImpl* file_read_hist, int level,
+    size_t max_file_size_for_l0_meta_pin) {
+  assert(may_match != nullptr);
+  *may_match = true;
+
+  TableReader* t = nullptr;
+  TypedHandle* handle = nullptr;
+  Status s = FindTable(options, file_options_, internal_comparator, file_meta,
+                       &handle, mutable_cf_options, &t,
+                       options.read_tier == kBlockCacheTier /* no_io */,
+                       file_read_hist,
+                       /*skip_filters=*/false, level,
+                       true /* prefetch_index_and_filter_in_cache */,
+                       max_file_size_for_l0_meta_pin, file_meta.temperature,
+                       should_pin_table_handles_);
+  if (s.ok()) {
+    s = t->KeyMayMatch(options, k, get_context,
+                       mutable_cf_options.prefix_extractor.get(), may_match);
+  } else if (options.read_tier == kBlockCacheTier && s.IsIncomplete()) {
+    // With memory-only reads, inability to load table/filter metadata cannot
+    // prove absence.
+    *may_match = true;
+    s = Status::OK();
+  }
+
+  if (handle != nullptr) {
+    cache_.Release(handle);
+  }
+  return s;
+}
+
 void TableCache::UpdateRangeTombstoneSeqnums(
     const ReadOptions& options, TableReader* t,
     MultiGetContext::Range& table_range) {

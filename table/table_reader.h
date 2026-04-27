@@ -137,6 +137,18 @@ class TableReader {
                      const SliceTransform* prefix_extractor,
                      bool skip_filters = false) = 0;
 
+  // Checks table filters only. Implementations must set may_match=false only
+  // when the key is definitely absent according to a filter; otherwise leave it
+  // true. This must not read data blocks or call GetContext::SaveValue().
+  virtual Status KeyMayMatch(const ReadOptions& /*readOptions*/,
+                             const Slice& /*key*/,
+                             GetContext* /*get_context*/,
+                             const SliceTransform* /*prefix_extractor*/,
+                             bool* may_match) {
+    *may_match = true;
+    return Status::OK();
+  }
+
   // Use bloom filters in the table file, if present, to filter out keys. The
   // mget_range will be updated to skip keys that get a negative result from
   // the filter lookup.

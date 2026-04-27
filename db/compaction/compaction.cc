@@ -71,10 +71,7 @@ void Compaction::FinalizeInputInfo(Version* _input_version) {
   if ((cfd_->ioptions().compaction_style == kCompactionStyleTiered &&
        start_level_ != output_level_) ||
       cfd_->ioptions().compaction_style == kCompactionStyleUDP) {
-    output_sorted_run_id_ =
-        preselected_output_sorted_run_id_ != 0
-            ? preselected_output_sorted_run_id_
-            : input_version_->version_set()->NewSortedRunId();
+    output_sorted_run_id_ = input_version_->version_set()->NewSortedRunId();
   }
 
   cfd_->Ref();

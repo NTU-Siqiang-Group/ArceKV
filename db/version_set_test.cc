@@ -10,6 +10,7 @@
 #include "db/version_set.h"
 
 #include <algorithm>
+#include <cstdio>
 
 #include "db/blob/blob_log_writer.h"
 #include "db/db_impl/db_impl.h"
@@ -20,16 +21,132 @@
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/perf_context.h"
 #include "table/block_based/block_based_table_factory.h"
+#include "table/block_based/filter_policy_internal.h"
 #include "table/mock_table.h"
 #include "table/unique_id_impl.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/coding.h"
+#include "util/hash.h"
 #include "util/defer.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class ExactFilterBitsBuilder : public FilterBitsBuilder {
+ public:
+  void AddKey(const Slice& key) override {
+    hashes_.push_back(Hash(key.data(), key.size(), 1));
+  }
+
+  void AddKeyAndAlt(const Slice& key, const Slice& alt) override {
+    AddKey(key);
+    AddKey(alt);
+  }
+
+  using FilterBitsBuilder::Finish;
+
+  Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    const uint32_t len = static_cast<uint32_t>(hashes_.size()) * 4;
+    char* data = new char[len];
+    for (size_t i = 0; i < hashes_.size(); ++i) {
+      EncodeFixed32(data + i * 4, hashes_[i]);
+    }
+    buf->reset(data);
+    return Slice(data, len);
+  }
+
+  size_t EstimateEntriesAdded() override { return hashes_.size(); }
+  size_t ApproximateNumEntries(size_t bytes) override { return bytes / 4; }
+  size_t CalculateSpace(size_t num_entries) override { return num_entries * 4; }
+  double EstimatedFpRate(size_t, size_t) override { return 0.0; }
+
+ private:
+  std::vector<uint32_t> hashes_;
+};
+
+class ExactFilterBitsReader : public FilterBitsReader {
+ public:
+  explicit ExactFilterBitsReader(const Slice& contents)
+      : data_(contents.data()), len_(static_cast<uint32_t>(contents.size())) {}
+
+  using FilterBitsReader::MayMatch;
+
+  bool MayMatch(const Slice& entry) override {
+    const uint32_t h = Hash(entry.data(), entry.size(), 1);
+    for (size_t i = 0; i + 4 <= len_; i += 4) {
+      if (h == DecodeFixed32(data_ + i)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+ private:
+  const char* data_;
+  uint32_t len_;
+};
+
+class ExactFilterPolicy : public FilterPolicy {
+ public:
+  const char* Name() const override { return "ExactFilterPolicy"; }
+  const char* CompatibilityName() const override { return Name(); }
+
+  FilterBitsBuilder* GetBuilderWithContext(
+      const FilterBuildingContext&) const override {
+    return new ExactFilterBitsBuilder();
+  }
+
+  FilterBitsReader* GetFilterBitsReader(const Slice& contents) const override {
+    return new ExactFilterBitsReader(contents);
+  }
+};
+
+class AlwaysMatchFilterBitsBuilder : public FilterBitsBuilder {
+ public:
+  void AddKey(const Slice&) override {}
+  void AddKeyAndAlt(const Slice&, const Slice&) override {}
+
+  using FilterBitsBuilder::Finish;
+
+  Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    char* data = new char[1]{0};
+    buf->reset(data);
+    return Slice(data, 1);
+  }
+
+  size_t EstimateEntriesAdded() override { return 0; }
+  size_t ApproximateNumEntries(size_t) override { return 0; }
+  size_t CalculateSpace(size_t) override { return 1; }
+  double EstimatedFpRate(size_t, size_t) override { return 1.0; }
+};
+
+class AlwaysMatchFilterBitsReader : public FilterBitsReader {
+ public:
+  explicit AlwaysMatchFilterBitsReader(const Slice&) {}
+
+  using FilterBitsReader::MayMatch;
+
+  bool MayMatch(const Slice&) override { return true; }
+};
+
+class AlwaysMatchFilterPolicy : public FilterPolicy {
+ public:
+  const char* Name() const override { return "AlwaysMatchFilterPolicy"; }
+  const char* CompatibilityName() const override { return Name(); }
+
+  FilterBitsBuilder* GetBuilderWithContext(
+      const FilterBuildingContext&) const override {
+    return new AlwaysMatchFilterBitsBuilder();
+  }
+
+  FilterBitsReader* GetFilterBitsReader(const Slice& contents) const override {
+    return new AlwaysMatchFilterBitsReader(contents);
+  }
+};
 
 class GenerateLevelFilesBriefTest : public testing::Test {
  public:
@@ -1687,6 +1804,14 @@ class TieredVersionReadTest : public VersionSetTest {
 
   void EnableUDPReads() { cf_options_.compaction_style = kCompactionStyleUDP; }
 
+  void UseBlockBasedTableFactory(
+      const std::shared_ptr<const FilterPolicy>& filter_policy) {
+    BlockBasedTableOptions table_options;
+    table_options.filter_policy = filter_policy;
+    table_factory_.reset(NewBlockBasedTableFactory(table_options));
+    cf_options_.table_factory = table_factory_;
+    mutable_cf_options_.table_factory = table_factory_;
+  }
   FileMetaData CreateMockFile(const MockFileSpec& spec) {
     EXPECT_FALSE(spec.entries.empty());
 
@@ -1737,6 +1862,71 @@ class TieredVersionReadTest : public VersionSetTest {
     VersionEdit edit;
     for (const auto& file : files) {
       edit.AddFile(file.level, CreateMockFile(file));
+    }
+    ASSERT_OK(LogAndApplyToDefaultCF(edit));
+  }
+
+  FileMetaData CreateTableFile(const MockFileSpec& spec) {
+    EXPECT_FALSE(spec.entries.empty());
+
+    std::vector<std::pair<InternalKey, std::string>> internal_entries;
+    internal_entries.reserve(spec.entries.size());
+    for (const auto& entry : spec.entries) {
+      internal_entries.emplace_back(
+          InternalKey(entry.user_key, entry.seq, entry.type), entry.value);
+    }
+
+    InternalKeyComparator icmp(options_.comparator);
+    std::sort(internal_entries.begin(), internal_entries.end(),
+              [&icmp](const auto& lhs, const auto& rhs) {
+                return icmp.Compare(lhs.first.Encode(), rhs.first.Encode()) < 0;
+              });
+
+    std::string fname = MakeTableFileName(dbname_, spec.file_number);
+    std::unique_ptr<FSWritableFile> file;
+    Status status = fs_->NewWritableFile(fname, FileOptions(), &file, nullptr);
+    EXPECT_OK(status);
+    std::unique_ptr<WritableFileWriter> fwriter(new WritableFileWriter(
+        std::move(file), fname, FileOptions(), env_->GetSystemClock().get()));
+    InternalTblPropCollFactories internal_tbl_prop_coll_factories;
+    std::unique_ptr<TableBuilder> builder(table_factory_->NewTableBuilder(
+        TableBuilderOptions(
+            immutable_options_, mutable_cf_options_, ReadOptions(),
+            WriteOptions(), InternalKeyComparator(options_.comparator),
+            &internal_tbl_prop_coll_factories, kNoCompression,
+            CompressionOptions(),
+            TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
+            kDefaultColumnFamilyName, spec.level, kUnknownNewestKeyTime),
+        fwriter.get()));
+    for (const auto& entry : internal_entries) {
+      builder->Add(entry.first.Encode(), entry.second);
+    }
+    status = builder->Finish();
+    EXPECT_OK(status);
+    status = fwriter->Flush(IOOptions());
+    EXPECT_OK(status);
+
+    uint64_t file_size = 0;
+    status = fs_->GetFileSize(fname, IOOptions(), &file_size, nullptr);
+    EXPECT_OK(status);
+    EXPECT_GT(file_size, 0U);
+
+    return FileMetaData(
+        spec.file_number, /*file_path_id=*/0, file_size,
+        internal_entries.front().first, internal_entries.back().first,
+        /*smallest_seqno=*/0, /*largest_seqno=*/0,
+        /*marked_for_compact=*/false, Temperature::kUnknown,
+        kInvalidBlobFileNumber, kUnknownOldestAncesterTime,
+        kUnknownFileCreationTime, /*epoch_number=*/1, kUnknownFileChecksum,
+        kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
+        /*user_defined_timestamps_persisted=*/true,
+        /*min timestamp=*/"", /*max timestamp=*/"", spec.sorted_run_id);
+  }
+
+  void InstallTableFiles(const std::vector<MockFileSpec>& files) {
+    VersionEdit edit;
+    for (const auto& file : files) {
+      edit.AddFile(file.level, CreateTableFile(file));
     }
     ASSERT_OK(LogAndApplyToDefaultCF(edit));
   }
@@ -1793,6 +1983,12 @@ class TieredVersionReadTest : public VersionSetTest {
     return result;
   }
 };
+
+namespace {
+PerfContextByLevel& GetLevelPerfContext(uint32_t level) {
+  return (*(get_perf_context()->level_to_perf_context))[level];
+}
+}  // namespace
 
 TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   NewDB();
@@ -2031,6 +2227,111 @@ TEST_F(TieredVersionReadTest, UDPIteratorMergesUnorderedOverlappingRuns) {
   ASSERT_EQ(expected, ScanCurrentVersion());
 }
 
+TEST_F(TieredVersionReadTest,
+       UDPBloomUsefulMissDoesNotCauseFalseNegative) {
+  EnableUDPReads();
+  UseBlockBasedTableFactory(std::make_shared<ExactFilterPolicy>());
+  NewDB();
+
+  InstallTableFiles({
+      MockFileSpec{11, 1, 100,
+                   {{"a", 20, "va"}, {"z", 19, "vz"}}},
+      MockFileSpec{21, 1, 10, {{"m", 30, "hit"}}},
+  });
+
+  const auto prev_perf_level = GetPerfLevel();
+  SetPerfLevel(PerfLevel::kEnableCount);
+  auto restore_perf_level = [&]() { SetPerfLevel(prev_perf_level); };
+  Defer restore_perf_level_defer(restore_perf_level);
+
+  get_perf_context()->Reset();
+  get_perf_context()->EnablePerLevelPerfContext();
+
+  ASSERT_EQ("hit", GetFromCurrentVersion("m"));
+  ASSERT_EQ(1U, get_perf_context()->bloom_sst_hit_count);
+  ASSERT_EQ(1U, get_perf_context()->bloom_sst_miss_count);
+  EXPECT_EQ(1U, GetLevelPerfContext(1).bloom_filter_full_positive);
+  EXPECT_EQ(1U, GetLevelPerfContext(1).bloom_filter_useful);
+}
+
+TEST_F(TieredVersionReadTest,
+       UDPBloomFalsePositiveIsHandledByMergeIterator) {
+  EnableUDPReads();
+  UseBlockBasedTableFactory(
+      std::shared_ptr<const FilterPolicy>(NewBloomFilterPolicy(1)));
+  NewDB();
+
+  auto format_key = [](int index) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "k%04d", index);
+    return std::string(buf);
+  };
+  auto format_value = [](int index) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "v%04d", index);
+    return std::string(buf);
+  };
+
+  std::vector<MockEntry> older_entries;
+  std::vector<MockEntry> newer_entries;
+  for (int i = 0; i < 1000; i += 2) {
+    older_entries.emplace_back(
+        MockEntry{format_key(i), 20, "old", kTypeValue});
+    newer_entries.emplace_back(
+        MockEntry{format_key(i + 1), 30, format_value(i + 1), kTypeValue});
+  }
+
+  InstallTableFiles({
+      MockFileSpec{31, 1, 100, older_entries},
+      MockFileSpec{41, 1, 10, newer_entries},
+  });
+
+  ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(nullptr, cfd);
+  Version* version = cfd->current();
+  ASSERT_NE(nullptr, version);
+  TableCache* table_cache = cfd->table_cache();
+  ASSERT_NE(nullptr, table_cache);
+  FileMetaData* false_positive_file = nullptr;
+  for (auto* file : version->storage_info()->LevelFiles(1)) {
+    if (file->fd.GetNumber() == 31U) {
+      false_positive_file = file;
+      break;
+    }
+  }
+  ASSERT_NE(nullptr, false_positive_file);
+
+  std::string false_positive_key;
+  for (int i = 1; i < 1000; i += 2) {
+    std::string candidate = format_key(i);
+    LookupKey lkey(candidate, kMaxSequenceNumber);
+    bool may_match = false;
+    Status status = table_cache->KeyMayMatch(
+        ReadOptions(), cfd->internal_comparator(), *false_positive_file,
+        lkey.internal_key(), /*get_context=*/nullptr, mutable_cf_options_,
+        &may_match, cfd->internal_stats()->GetFileReadHist(1), /*level=*/1,
+        MaxFileSizeForL0MetaPin(mutable_cf_options_));
+    ASSERT_OK(status);
+    if (may_match) {
+      false_positive_key = candidate;
+      break;
+    }
+  }
+  ASSERT_FALSE(false_positive_key.empty());
+
+  const auto prev_perf_level = GetPerfLevel();
+  SetPerfLevel(PerfLevel::kEnableCount);
+  auto restore_perf_level = [&]() { SetPerfLevel(prev_perf_level); };
+  Defer restore_perf_level_defer(restore_perf_level);
+
+  get_perf_context()->Reset();
+  get_perf_context()->EnablePerLevelPerfContext();
+
+  ASSERT_EQ("v" + false_positive_key.substr(1),
+            GetFromCurrentVersion(false_positive_key));
+  EXPECT_EQ(2U, GetLevelPerfContext(1).bloom_filter_full_positive);
+  EXPECT_EQ(0U, GetLevelPerfContext(1).bloom_filter_useful);
+}
 TEST_F(VersionSetTest, PersistBlobFileStateInNewManifest) {
   // Initialize the database and add a couple of blob files, one with some
   // garbage in it, and one without any garbage.

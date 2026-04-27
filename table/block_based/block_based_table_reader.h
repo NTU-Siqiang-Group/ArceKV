@@ -150,6 +150,11 @@ class BlockBasedTable : public TableReader {
              GetContext* get_context, const SliceTransform* prefix_extractor,
              bool skip_filters = false) override;
 
+  Status KeyMayMatch(const ReadOptions& read_options, const Slice& key,
+                     GetContext* get_context,
+                     const SliceTransform* prefix_extractor,
+                     bool* may_match) override;
+
   Status MultiGetFilter(const ReadOptions& read_options,
                         const SliceTransform* prefix_extractor,
                         MultiGetRange* mget_range) override;

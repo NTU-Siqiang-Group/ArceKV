@@ -2911,6 +2911,212 @@ void Version::MultiGetBlob(
   }
 }
 
+void Version::GetFromUDP(const ReadOptions& read_options, const Slice& ikey,
+                         const Slice& user_key, GetContext* get_context,
+                         bool* is_blob_index, bool do_merge,
+                         PinnableSlice* value, PinnableWideColumns* columns,
+                         Status* status, MergeContext* merge_context,
+                         bool* key_exists) {
+  assert(storage_info_.IsUDP());
+
+  struct UDPGetCandidate {
+    int level;
+    FileMetaData* file;
+  };
+
+  std::vector<UDPGetCandidate> candidates;
+  const Comparator* ucmp = user_comparator();
+  auto key_in_file_range = [&](const FdWithKeyRange& file) {
+    return ucmp->CompareWithoutTimestamp(
+               user_key, ExtractUserKey(file.smallest_key)) >= 0 &&
+           ucmp->CompareWithoutTimestamp(user_key,
+                                         ExtractUserKey(file.largest_key)) <= 0;
+  };
+
+  if (storage_info_.num_non_empty_levels() > 0 &&
+      storage_info_.LevelFilesBrief(0).num_files > 0) {
+    const auto& l0_files = storage_info_.LevelFilesBrief(0);
+    for (size_t i = 0; i < l0_files.num_files; ++i) {
+      const auto& file = l0_files.files[i];
+      if (key_in_file_range(file)) {
+        candidates.push_back({0, file.file_metadata});
+      }
+    }
+  }
+
+  for (int level = 1; level < storage_info_.num_non_empty_levels(); ++level) {
+    const auto& level_runs = storage_info_.LevelSortedRuns(level);
+    for (const auto& run : level_runs.runs) {
+      if (run.files.num_files == 0) {
+        continue;
+      }
+      const size_t file_index =
+          static_cast<size_t>(FindFile(*internal_comparator(), run.files, ikey));
+      if (file_index >= run.files.num_files) {
+        continue;
+      }
+      const auto& file = run.files.files[file_index];
+      if (key_in_file_range(file)) {
+        candidates.push_back({level, file.file_metadata});
+      }
+    }
+  }
+
+  Arena arena;
+  MergeIteratorBuilder merge_iter_builder(internal_comparator(), &arena,
+                                          false /* prefix_seek_mode */);
+  for (const auto& candidate : candidates) {
+    bool may_match = true;
+    *status = table_cache_->KeyMayMatch(
+        read_options, *internal_comparator(), *candidate.file, ikey,
+        get_context, mutable_cf_options_, &may_match,
+        cfd_->internal_stats()->GetFileReadHist(candidate.level),
+        candidate.level, max_file_size_for_l0_meta_pin_);
+    if (!status->ok()) {
+      return;
+    }
+    if (!may_match) {
+      continue;
+    }
+
+    // UDP Bloom preselection currently ignores range-deletion correctness:
+    // point filters do not prove absence of covering range tombstones. TODO:
+    // keep Bloom-negative files that may contain range tombstones, or add a
+    // range-tombstone-aware metadata/filter check.
+    auto table_iter = table_cache_->NewIterator(
+        read_options, file_options_, *internal_comparator(), *candidate.file,
+        /*range_del_agg=*/nullptr, mutable_cf_options_,
+        /*table_reader_ptr=*/nullptr,
+        cfd_->internal_stats()->GetFileReadHist(candidate.level),
+        TableReaderCaller::kUserIterator, &arena,
+        /*skip_filters=*/false, /*level=*/candidate.level,
+        max_file_size_for_l0_meta_pin_,
+        /*smallest_compaction_key=*/nullptr,
+        /*largest_compaction_key=*/nullptr,
+        /*allow_unprepared_value=*/false,
+        /*range_del_read_seqno=*/nullptr,
+        /*range_del_iter=*/nullptr,
+        /*maybe_pin_table_handle=*/true);
+    merge_iter_builder.AddIterator(table_iter);
+  }
+
+  ScopedArenaPtr<InternalIterator> iter(merge_iter_builder.Finish());
+  ParsedInternalKey parsed_key;
+  bool matched = false;
+  for (iter->Seek(ikey); iter->Valid(); iter->Next()) {
+    *status = ParseInternalKey(iter->key(), &parsed_key,
+                               /*log_err_key=*/true);
+    if (!status->ok()) {
+      return;
+    }
+    if (!user_comparator()->EqualWithoutTimestamp(parsed_key.user_key,
+                                                  user_key)) {
+      break;
+    }
+    const bool need_more = get_context->SaveValue(
+        parsed_key, iter->value(), &matched, status,
+        /*value_pinner=*/nullptr);
+    if (!status->ok() || !need_more) {
+      break;
+    }
+  }
+  if (status->ok() && !iter->status().ok()) {
+    *status = iter->status();
+  }
+  if (!status->ok()) {
+    if (db_statistics_ != nullptr) {
+      get_context->ReportCounters();
+    }
+    return;
+  }
+
+  if (get_context->State() != GetContext::kNotFound &&
+      get_context->State() != GetContext::kMerge && db_statistics_ != nullptr) {
+    get_context->ReportCounters();
+  }
+  switch (get_context->State()) {
+    case GetContext::kNotFound:
+      break;
+    case GetContext::kMerge:
+      break;
+    case GetContext::kFound:
+      if (*is_blob_index && do_merge && (value || columns)) {
+        Slice blob_index =
+            value ? *value
+                  : WideColumnsHelper::GetDefaultColumn(columns->columns());
+
+        TEST_SYNC_POINT_CALLBACK("Version::Get::TamperWithBlobIndex",
+                                 &blob_index);
+
+        constexpr FilePrefetchBuffer* prefetch_buffer = nullptr;
+        PinnableSlice result;
+        constexpr uint64_t* bytes_read = nullptr;
+
+        *status = GetBlob(read_options, get_context->ukey_to_get_blob_value(),
+                          blob_index, prefetch_buffer, &result, bytes_read);
+        if (!status->ok()) {
+          if (status->IsIncomplete()) {
+            get_context->MarkKeyMayExist();
+          }
+          return;
+        }
+
+        if (value) {
+          *value = std::move(result);
+        } else {
+          assert(columns);
+          columns->SetPlainValue(std::move(result));
+        }
+      }
+      return;
+    case GetContext::kDeleted:
+      *status = Status::NotFound();
+      return;
+    case GetContext::kCorrupt:
+      *status = Status::Corruption("corrupted key for ", user_key);
+      return;
+    case GetContext::kUnexpectedBlobIndex:
+      ROCKS_LOG_ERROR(info_log_, "Encounter unexpected blob index.");
+      *status = Status::NotSupported(
+          "Encounter unexpected blob index. Please open DB with "
+          "ROCKSDB_NAMESPACE::blob_db::BlobDB instead.");
+      return;
+    case GetContext::kMergeOperatorFailed:
+      *status = Status::Corruption(Status::SubCode::kMergeOperatorFailed);
+      return;
+  }
+
+  if (db_statistics_ != nullptr) {
+    get_context->ReportCounters();
+  }
+  if (GetContext::kMerge == get_context->State()) {
+    if (!do_merge) {
+      *status = Status::OK();
+      return;
+    }
+    if (!merge_operator_) {
+      *status =
+          Status::InvalidArgument("merge_operator is not properly initialized.");
+      return;
+    }
+    if (value || columns) {
+      *status = MergeHelper::TimedFullMerge(
+          merge_operator_, user_key, MergeHelper::kNoBaseValue,
+          merge_context->GetOperands(), info_log_, db_statistics_, clock_,
+          /*update_num_ops_stats=*/true, /*op_failure_scope=*/nullptr,
+          value ? value->GetSelf() : nullptr, columns);
+      if (status->ok() && LIKELY(value != nullptr)) {
+        value->PinSelf();
+      }
+    }
+  } else {
+    if (key_exists != nullptr) {
+      *key_exists = false;
+    }
+    *status = Status::NotFound();
+  }
+}
+
 void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                   PinnableSlice* value, PinnableWideColumns* columns,
                   std::string* timestamp, Status* status,
@@ -2958,133 +3164,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   }
 
   if (storage_info_.IsUDP()) {
-    Arena arena;
-    MergeIteratorBuilder merge_iter_builder(internal_comparator(), &arena,
-                                            false /* prefix_seek_mode */);
-    for (int level = 0; level < storage_info_.num_non_empty_levels(); ++level) {
-      AddTieredIteratorsForLevel(read_options, file_options_,
-                                 &merge_iter_builder, level,
-                                 /*allow_unprepared_value=*/false);
-    }
-    ScopedArenaPtr<InternalIterator> iter(merge_iter_builder.Finish());
-    ParsedInternalKey parsed_key;
-    bool matched = false;
-    for (iter->Seek(ikey); iter->Valid(); iter->Next()) {
-      *status = ParseInternalKey(iter->key(), &parsed_key,
-                                 /*log_err_key=*/true);
-      if (!status->ok()) {
-        return;
-      }
-      if (!user_comparator()->EqualWithoutTimestamp(parsed_key.user_key,
-                                                    user_key)) {
-        break;
-      }
-      const bool need_more = get_context.SaveValue(
-          parsed_key, iter->value(), &matched, status,
-          /*value_pinner=*/nullptr);
-      if (!status->ok() || !need_more) {
-        break;
-      }
-    }
-    if (status->ok() && !iter->status().ok()) {
-      *status = iter->status();
-    }
-    if (!status->ok()) {
-      if (db_statistics_ != nullptr) {
-        get_context.ReportCounters();
-      }
-      return;
-    }
-
-    if (get_context.State() != GetContext::kNotFound &&
-        get_context.State() != GetContext::kMerge &&
-        db_statistics_ != nullptr) {
-      get_context.ReportCounters();
-    }
-    switch (get_context.State()) {
-      case GetContext::kNotFound:
-        break;
-      case GetContext::kMerge:
-        break;
-      case GetContext::kFound:
-        if (is_blob_index && do_merge && (value || columns)) {
-          Slice blob_index =
-              value ? *value
-                    : WideColumnsHelper::GetDefaultColumn(columns->columns());
-
-          TEST_SYNC_POINT_CALLBACK("Version::Get::TamperWithBlobIndex",
-                                   &blob_index);
-
-          constexpr FilePrefetchBuffer* prefetch_buffer = nullptr;
-
-          PinnableSlice result;
-
-          constexpr uint64_t* bytes_read = nullptr;
-
-          *status = GetBlob(read_options, get_context.ukey_to_get_blob_value(),
-                            blob_index, prefetch_buffer, &result, bytes_read);
-          if (!status->ok()) {
-            if (status->IsIncomplete()) {
-              get_context.MarkKeyMayExist();
-            }
-            return;
-          }
-
-          if (value) {
-            *value = std::move(result);
-          } else {
-            assert(columns);
-            columns->SetPlainValue(std::move(result));
-          }
-        }
-        return;
-      case GetContext::kDeleted:
-        *status = Status::NotFound();
-        return;
-      case GetContext::kCorrupt:
-        *status = Status::Corruption("corrupted key for ", user_key);
-        return;
-      case GetContext::kUnexpectedBlobIndex:
-        ROCKS_LOG_ERROR(info_log_, "Encounter unexpected blob index.");
-        *status = Status::NotSupported(
-            "Encounter unexpected blob index. Please open DB with "
-            "ROCKSDB_NAMESPACE::blob_db::BlobDB instead.");
-        return;
-      case GetContext::kMergeOperatorFailed:
-        *status = Status::Corruption(Status::SubCode::kMergeOperatorFailed);
-        return;
-    }
-    if (db_statistics_ != nullptr) {
-      get_context.ReportCounters();
-    }
-    if (GetContext::kMerge == get_context.State()) {
-      if (!do_merge) {
-        *status = Status::OK();
-        return;
-      }
-      if (!merge_operator_) {
-        *status = Status::InvalidArgument(
-            "merge_operator is not properly initialized.");
-        return;
-      }
-      if (value || columns) {
-        *status = MergeHelper::TimedFullMerge(
-            merge_operator_, user_key, MergeHelper::kNoBaseValue,
-            merge_context->GetOperands(), info_log_, db_statistics_, clock_,
-            /*update_num_ops_stats=*/true, /*op_failure_scope=*/nullptr,
-            value ? value->GetSelf() : nullptr, columns);
-        if (status->ok()) {
-          if (LIKELY(value != nullptr)) {
-            value->PinSelf();
-          }
-        }
-      }
-    } else {
-      if (key_exists != nullptr) {
-        *key_exists = false;
-      }
-      *status = Status::NotFound();
-    }
+    GetFromUDP(read_options, ikey, user_key, &get_context, is_blob_to_use,
+               do_merge, value, columns, status, merge_context, key_exists);
     return;
   }
 
