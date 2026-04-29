@@ -1,6 +1,8 @@
 # ArceKV optimized for In-memory service
 ⚠️ This repository contains **environment-specific adaptations** for the TikTok Recommendation Service and **does not represent a faithful implementation of** [ArceKV](https://www.arxiv.org/pdf/2508.03565).
 
+**[29/04/2026]** We publish an on-disk version of ArceKV under [dev](https://github.com/NTU-Siqiang-Group/ArceKV/tree/dev) branch.
+
 ## Key Modifications
 
 - **Simplified write-stop strategy**  
