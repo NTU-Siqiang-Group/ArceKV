@@ -274,6 +274,16 @@ case "$TARGET_OS" in
         exit 1
 esac
 
+if [ -z "$USE_OPENMP" ] || [ "$USE_OPENMP" = "1" ]; then
+    if echo '#include <omp.h>
+int main() { return omp_get_max_threads() > 0 ? 0 : 0; }' |
+        $CXX $PLATFORM_CXXFLAGS $COMMON_FLAGS -fopenmp -x c++ - \
+            -o /dev/null >/dev/null 2>&1; then
+        PLATFORM_CXXFLAGS="$PLATFORM_CXXFLAGS -fopenmp"
+        PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -fopenmp"
+    fi
+fi
+
 PLATFORM_CXXFLAGS="$PLATFORM_CXXFLAGS ${CXXFLAGS}"
 JAVA_LDFLAGS="$PLATFORM_LDFLAGS"
 JAVA_STATIC_LDFLAGS="$PLATFORM_LDFLAGS"

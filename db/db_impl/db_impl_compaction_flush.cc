@@ -115,10 +115,13 @@ bool DBImpl::ShouldRescheduleFlushRequestToRetainUDT(
   // until the last memtable is 10% full. To avoid that scenario, the criteria
   // this uses should be the same or less strict than
   // `WaitUntilFlushWouldNotStallWrites` does.
+  const auto* vstorage = cfd->current()->storage_info();
+  int compaction_pressure = ColumnFamilyData::GetCompactionPressureTokenCount(
+      vstorage, mutable_cf_options, cfd->ioptions());
   WriteStallCondition write_stall =
       ColumnFamilyData::GetWriteStallConditionAndCause(
           cfd->GetUnflushedMemTableCountForWriteStallCheck(),
-          /*num_l0_files=*/0,
+          compaction_pressure,
           /*num_compaction_needed_bytes=*/0, mutable_cf_options,
           cfd->ioptions())
           .first;
@@ -1360,7 +1363,7 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
       } else {
         assert(cfd->ioptions().compaction_style == kCompactionStyleLevel ||
                cfd->ioptions().compaction_style == kCompactionStyleTiered ||
-               cfd->ioptions().compaction_style == kCompactionStyleUDP);
+               cfd->ioptions().compaction_style == kCompactionStyleArce);
         uint64_t next_file_number = versions_->current_next_file_number();
         // Start compaction from `first_overlapped_level`, one level down at a
         // time, until output level >= max_overlapped_level.
@@ -2956,6 +2959,8 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
 
       const auto& mutable_cf_options = cfd->GetLatestMutableCFOptions();
       const auto* vstorage = cfd->current()->storage_info();
+      int compaction_pressure = ColumnFamilyData::GetCompactionPressureTokenCount(
+          vstorage, mutable_cf_options, cfd->ioptions());
 
       // Skip stalling check if we're below auto-flush and auto-compaction
       // triggers. If it stalled in these conditions, that'd mean the stall
@@ -2963,7 +2968,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
       // that case we shouldn't wait since background work won't be scheduled.
       if (cfd->imm()->NumNotFlushed() <
               cfd->ioptions().min_write_buffer_number_to_merge &&
-          vstorage->l0_delay_trigger_count() <
+          compaction_pressure <
               mutable_cf_options.level0_file_num_compaction_trigger) {
         break;
       }
@@ -2976,7 +2981,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
       write_stall_condition =
           ColumnFamilyData::GetWriteStallConditionAndCause(
               cfd->GetUnflushedMemTableCountForWriteStallCheck(),
-              vstorage->l0_delay_trigger_count() + 1,
+              compaction_pressure + 1,
               vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
               cfd->ioptions())
               .first;

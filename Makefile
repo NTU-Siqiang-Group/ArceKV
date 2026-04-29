@@ -43,6 +43,7 @@ quoted_perl_command = $(subst ','\'',$(perl_command))
 
 # Set the default DEBUG_LEVEL to 1
 DEBUG_LEVEL?=1
+USE_OPENMP ?= 1
 
 # OBJ_DIR is where the object files reside.  Default to the current directory
 OBJ_DIR?=.
@@ -97,6 +98,7 @@ dummy := $(shell (export ROCKSDB_ROOT="$(CURDIR)"; \
                   export COMPILE_WITH_ASAN="$(COMPILE_WITH_ASAN)"; \
                   export COMPILE_WITH_TSAN="$(COMPILE_WITH_TSAN)"; \
                   export COMPILE_WITH_UBSAN="$(COMPILE_WITH_UBSAN)"; \
+                  export USE_OPENMP="$(USE_OPENMP)"; \
                   export PORTABLE="$(PORTABLE)"; \
                   export ROCKSDB_NO_FBCODE="$(ROCKSDB_NO_FBCODE)"; \
                   export USE_CLANG="$(USE_CLANG)"; \

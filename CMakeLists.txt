@@ -99,6 +99,7 @@ option(WITH_SNAPPY "build with SNAPPY" OFF)
 option(WITH_LZ4 "build with lz4" OFF)
 option(WITH_ZLIB "build with zlib" OFF)
 option(WITH_ZSTD "build with zstd" OFF)
+option(WITH_OPENMP "build with OpenMP when supported" ON)
 option(WITH_WINDOWS_UTF8_FILENAMES "use UTF8 as characterset for opening files, regardles of the system code page" OFF)
 if (WITH_WINDOWS_UTF8_FILENAMES)
   add_definitions(-DROCKSDB_WINDOWS_UTF8_FILENAMES)
@@ -202,6 +203,16 @@ else()
     add_definitions(-DZSTD)
     include_directories(${ZSTD_INCLUDE_DIRS})
     list(APPEND THIRDPARTY_LIBS zstd::zstd)
+  endif()
+
+  if(WITH_OPENMP)
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+      list(APPEND THIRDPARTY_LIBS OpenMP::OpenMP_CXX)
+      message(STATUS "Building with OpenMP support")
+    else()
+      message(STATUS "OpenMP support requested but not found; building without OpenMP")
+    endif()
   endif()
 endif()
 
@@ -729,7 +740,7 @@ set(SOURCES
         db/compaction/compaction_picker_fifo.cc
         db/compaction/compaction_picker_level.cc
         db/compaction/compaction_picker_tiered.cc
-        db/compaction/compaction_picker_udp.cc
+        db/compaction/compaction_picker_arce.cc
         db/compaction/compaction_picker_universal.cc
         db/compaction/compaction_service_job.cc
         db/compaction/compaction_state.cc

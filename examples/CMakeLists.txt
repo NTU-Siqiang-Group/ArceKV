@@ -50,8 +50,14 @@ add_executable(tiered_compaction_integration
 target_link_libraries(tiered_compaction_integration
   ${ROCKSDB_LIB})
 
-add_executable(udp_compaction_integration
+add_executable(arce_compaction_integration
   EXCLUDE_FROM_ALL
-  udp_compaction_integration.cc)
-target_link_libraries(udp_compaction_integration
+  arce_compaction_integration.cc)
+target_link_libraries(arce_compaction_integration
+  ${ROCKSDB_LIB})
+
+add_executable(arce_dynamic_compaction_integration
+  EXCLUDE_FROM_ALL
+  arce_dynamic_compaction_integration.cc)
+target_link_libraries(arce_dynamic_compaction_integration
   ${ROCKSDB_LIB})

@@ -494,9 +494,9 @@ class VersionStorageInfo {
 
   bool IsTiered() const { return compaction_style_ == kCompactionStyleTiered; }
 
-  bool IsUDP() const { return compaction_style_ == kCompactionStyleUDP; }
+  bool IsArce() const { return compaction_style_ == kCompactionStyleArce; }
 
-  bool IsSortedRunStyle() const { return IsTiered() || IsUDP(); }
+  bool IsSortedRunStyle() const { return IsTiered() || IsArce(); }
 
   const LevelSortedRunsBrief& LevelSortedRuns(int level) const {
     assert(level < static_cast<int>(level_sorted_runs_brief_.size()));
@@ -1168,7 +1168,7 @@ class Version {
                             const LevelFilesBrief& run_files,
                             bool allow_unprepared_value);
 
-  void GetFromUDP(const ReadOptions& read_options, const Slice& ikey,
+  void GetFromArce(const ReadOptions& read_options, const Slice& ikey,
                   const Slice& user_key, GetContext* get_context,
                   bool* is_blob_index, bool do_merge, PinnableSlice* value,
                   PinnableWideColumns* columns, Status* status,

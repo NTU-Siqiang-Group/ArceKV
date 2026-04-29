@@ -15,6 +15,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "db/blob/blob_file_cache.h"
@@ -24,7 +25,7 @@
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_tiered.h"
-#include "db/compaction/compaction_picker_udp.h"
+#include "db/compaction/compaction_picker_arce.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/db_impl/db_impl.h"
 #include "db/internal_stats.h"
@@ -212,7 +213,7 @@ Status CheckCFPathsSupported(const DBOptions& db_options,
   if ((cf_options.compaction_style != kCompactionStyleUniversal) &&
       (cf_options.compaction_style != kCompactionStyleLevel) &&
       (cf_options.compaction_style != kCompactionStyleTiered) &&
-      (cf_options.compaction_style != kCompactionStyleUDP)) {
+      (cf_options.compaction_style != kCompactionStyleArce)) {
     if (cf_options.cf_paths.size() > 1) {
       return Status::NotSupported(
           "More than one CF paths are only supported in "
@@ -282,7 +283,7 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
   }
   if ((result.compaction_style == kCompactionStyleLevel ||
        result.compaction_style == kCompactionStyleTiered ||
-       result.compaction_style == kCompactionStyleUDP) &&
+       result.compaction_style == kCompactionStyleArce) &&
       result.num_levels < 2) {
     result.num_levels = 2;
   }
@@ -691,9 +692,9 @@ ColumnFamilyData::ColumnFamilyData(
     } else if (ioptions_.compaction_style == kCompactionStyleTiered) {
       compaction_picker_.reset(
           new TieredCompactionPicker(ioptions_, &internal_comparator_));
-    } else if (ioptions_.compaction_style == kCompactionStyleUDP) {
+    } else if (ioptions_.compaction_style == kCompactionStyleArce) {
       compaction_picker_.reset(
-          new UDPCompactionPicker(ioptions_, &internal_comparator_));
+          new ArceCompactionPicker(ioptions_, &internal_comparator_));
     } else if (ioptions_.compaction_style == kCompactionStyleUniversal) {
       compaction_picker_.reset(
           new UniversalCompactionPicker(ioptions_, &internal_comparator_));
@@ -1016,12 +1017,61 @@ uint64_t GetMarkedFileCountForCompactionSpeedup() {
 }
 }  // anonymous namespace
 
+int ColumnFamilyData::GetCompactionPressureTokenCount(
+    const VersionStorageInfo* vstorage,
+    const MutableCFOptions& mutable_cf_options,
+    const ImmutableCFOptions& immutable_cf_options) {
+  if (immutable_cf_options.compaction_style == kCompactionStyleArce &&
+      mutable_cf_options.arce_compaction_controller != nullptr) {
+    int total_runs = 0;
+    for (int level = 0; level < vstorage->num_levels(); ++level) {
+      if (level == 0) {
+        total_runs += static_cast<int>(vstorage->NumLevelFiles(level));
+      } else {
+        std::unordered_set<uint64_t> run_ids;
+        for (const auto* file : vstorage->LevelFiles(level)) {
+          run_ids.insert(file->sorted_run_id);
+        }
+        total_runs += static_cast<int>(run_ids.size());
+      }
+    }
+    return total_runs;
+  }
+  return vstorage->l0_delay_trigger_count();
+}
+
 std::pair<WriteStallCondition, WriteStallCause>
 ColumnFamilyData::GetWriteStallConditionAndCause(
     int num_unflushed_memtables, int num_l0_files,
     uint64_t num_compaction_needed_bytes,
     const MutableCFOptions& mutable_cf_options,
     const ImmutableCFOptions& immutable_cf_options) {
+  if (immutable_cf_options.compaction_style == kCompactionStyleArce &&
+      mutable_cf_options.arce_compaction_controller != nullptr) {
+    auto [m, c] = mutable_cf_options.arce_compaction_controller->GetMc();
+    if (num_l0_files >= 4 * c) {
+      return {WriteStallCondition::kStopped,
+              WriteStallCause::kL0FileCountLimit};
+    }
+    if (num_l0_files >= c) {
+      return {WriteStallCondition::kDelayed,
+              WriteStallCause::kL0FileCountLimit};
+    }
+    if (num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) {
+      return {WriteStallCondition::kStopped,
+              WriteStallCause::kMemtableLimit};
+    }
+    if (mutable_cf_options.max_write_buffer_number > 3 &&
+        num_unflushed_memtables >=
+            mutable_cf_options.max_write_buffer_number - 1 &&
+        num_unflushed_memtables - 1 >=
+            immutable_cf_options.min_write_buffer_number_to_merge) {
+      return {WriteStallCondition::kDelayed,
+              WriteStallCause::kMemtableLimit};
+    }
+    return {WriteStallCondition::kNormal, WriteStallCause::kNone};
+  }
+
   if (num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) {
     return {WriteStallCondition::kStopped, WriteStallCause::kMemtableLimit};
   } else if (!mutable_cf_options.disable_auto_compactions &&
@@ -1062,9 +1112,11 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
     auto write_controller = column_family_set_->write_controller_;
     uint64_t compaction_needed_bytes =
         vstorage->estimated_compaction_needed_bytes();
+    int compaction_pressure = GetCompactionPressureTokenCount(
+        vstorage, mutable_cf_options, ioptions());
 
     auto write_stall_condition_and_cause = GetWriteStallConditionAndCause(
-        imm()->NumNotFlushed(), vstorage->l0_delay_trigger_count(),
+        imm()->NumNotFlushed(), compaction_pressure,
         vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
         ioptions());
     write_stall_condition = write_stall_condition_and_cause.first;

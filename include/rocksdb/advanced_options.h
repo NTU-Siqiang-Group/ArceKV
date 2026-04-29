@@ -14,6 +14,7 @@
 #include "rocksdb/cache.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/memtablerep.h"
+#include "rocksdb/arce_dynamic_compaction.h"
 #include "rocksdb/universal_compaction.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -33,8 +34,10 @@ enum CompactionStyle : char {
   kCompactionStyleFIFO = 0x2,
   // Tiered compaction style
   kCompactionStyleTiered = 0x3,
-  // UDP compaction style
-  kCompactionStyleUDP = 0x4,
+  // Arce compaction style
+  kCompactionStyleArce = 0x4,
+  // Deprecated compatibility alias for Arce compaction style.
+  kCompactionStyleUDP = kCompactionStyleArce,
   // Disable background compaction. Compaction jobs are submitted
   // via CompactFiles().
   kCompactionStyleNone = 0x5,
@@ -722,6 +725,12 @@ struct AdvancedColumnFamilyOptions {
 
   // The compaction style. Default: kCompactionStyleLevel
   CompactionStyle compaction_style = kCompactionStyleLevel;
+
+  // Optional controller for Arce dynamic compaction picking/stall control.
+  // When null and `compaction_style == kCompactionStyleArce`, RocksDB will
+  // instantiate a default controller in the mutable CF options.
+  std::shared_ptr<ArceDynamicCompaction::ArceCompactionController>
+      arce_compaction_controller = nullptr;
 
   // If level compaction_style = kCompactionStyleLevel, for each level,
   // which files are prioritized to be picked to compact.

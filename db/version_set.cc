@@ -18,6 +18,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -2911,20 +2912,20 @@ void Version::MultiGetBlob(
   }
 }
 
-void Version::GetFromUDP(const ReadOptions& read_options, const Slice& ikey,
+void Version::GetFromArce(const ReadOptions& read_options, const Slice& ikey,
                          const Slice& user_key, GetContext* get_context,
                          bool* is_blob_index, bool do_merge,
                          PinnableSlice* value, PinnableWideColumns* columns,
                          Status* status, MergeContext* merge_context,
                          bool* key_exists) {
-  assert(storage_info_.IsUDP());
+  assert(storage_info_.IsArce());
 
-  struct UDPGetCandidate {
+  struct ArceGetCandidate {
     int level;
     FileMetaData* file;
   };
 
-  std::vector<UDPGetCandidate> candidates;
+  std::vector<ArceGetCandidate> candidates;
   const Comparator* ucmp = user_comparator();
   auto key_in_file_range = [&](const FdWithKeyRange& file) {
     return ucmp->CompareWithoutTimestamp(
@@ -2979,7 +2980,7 @@ void Version::GetFromUDP(const ReadOptions& read_options, const Slice& ikey,
       continue;
     }
 
-    // UDP Bloom preselection currently ignores range-deletion correctness:
+    // Arce Bloom preselection currently ignores range-deletion correctness:
     // point filters do not prove absence of covering range tombstones. TODO:
     // keep Bloom-negative files that may contain range tombstones, or add a
     // range-tombstone-aware metadata/filter check.
@@ -3163,8 +3164,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     pinned_iters_mgr->StartPinning();
   }
 
-  if (storage_info_.IsUDP()) {
-    GetFromUDP(read_options, ikey, user_key, &get_context, is_blob_to_use,
+  if (storage_info_.IsArce()) {
+    GetFromArce(read_options, ikey, user_key, &get_context, is_blob_to_use,
                do_merge, value, columns, status, merge_context, key_exists);
     return;
   }
@@ -4113,7 +4114,7 @@ int VersionStorageInfo::MaxInputLevel() const {
       compaction_style_ == kCompactionStyleTiered) {
     return num_levels() - 2;
   }
-  if (compaction_style_ == kCompactionStyleUDP) {
+  if (compaction_style_ == kCompactionStyleArce) {
     return num_levels() - 1;
   }
   return 0;
@@ -4338,7 +4339,7 @@ void VersionStorageInfo::ComputeCompactionScore(
         immutable_options.compaction_style);
     return;
   }
-  if (IsUDP()) {
+  if (IsArce()) {
     for (int level = 0; level < num_levels(); ++level) {
       compaction_level_[level] = level;
       compaction_score_[level] = 0.0;
@@ -5080,7 +5081,7 @@ void VersionStorageInfo::UpdateFilesByCompactionPri(
       compaction_style_ == kCompactionStyleFIFO ||
       compaction_style_ == kCompactionStyleUniversal ||
       compaction_style_ == kCompactionStyleTiered ||
-      compaction_style_ == kCompactionStyleUDP) {
+      compaction_style_ == kCompactionStyleArce) {
     // don't need this
     return;
   }
@@ -8405,7 +8406,7 @@ InternalIterator* VersionSet::MakeInputIterator(
   auto cfd = c->column_family_data();
   const bool use_sorted_run_iters =
       (cfd->ioptions().compaction_style == kCompactionStyleTiered ||
-       cfd->ioptions().compaction_style == kCompactionStyleUDP);
+       cfd->ioptions().compaction_style == kCompactionStyleArce);
   // Level-0 files have to be merged together.  For other levels,
   // we will make a concatenating iterator per level.
   // TODO(opt): use concatenating iterator for level-0 if there is no overlap
@@ -8491,11 +8492,22 @@ InternalIterator* VersionSet::MakeInputIterator(
         continue;
       }
 
+      // Sorted-run compaction inputs may flatten multiple logical runs into one
+      // CompactionInputFiles. This is only safe because the files for each run
+      // are expected to remain contiguous and smallest-key ordered within that
+      // level input so we can rebuild one iterator per run here.
+      std::unordered_set<uint64_t> closed_run_ids;
       std::vector<FileMetaData*> run_files;
       uint64_t current_run_id = 0;
       bool has_current_run = false;
       for (FileMetaData* file : *c->inputs(which)) {
         if (!has_current_run || file->sorted_run_id != current_run_id) {
+          if (has_current_run) {
+            closed_run_ids.insert(current_run_id);
+          }
+          assert(closed_run_ids.count(file->sorted_run_id) == 0 &&
+                 "sorted-run input files must be grouped contiguously by "
+                 "sorted_run_id");
           add_run(level, &run_files);
           current_run_id = file->sorted_run_id;
           has_current_run = true;

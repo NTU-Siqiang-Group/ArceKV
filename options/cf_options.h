@@ -135,6 +135,13 @@ struct MutableCFOptions {
         experimental_mempurge_threshold(
             options.experimental_mempurge_threshold),
         disable_auto_compactions(options.disable_auto_compactions),
+        arce_compaction_controller(
+            options.arce_compaction_controller != nullptr
+                ? options.arce_compaction_controller
+                : (options.compaction_style == kCompactionStyleArce
+                       ? std::make_shared<ArceDynamicCompaction::
+                                              ArceCompactionController>()
+                       : nullptr)),
         table_factory(options.table_factory),
         soft_pending_compaction_bytes_limit(
             options.soft_pending_compaction_bytes_limit),
@@ -221,6 +228,8 @@ struct MutableCFOptions {
         prefix_extractor(nullptr),
         experimental_mempurge_threshold(0.0),
         disable_auto_compactions(false),
+        arce_compaction_controller(nullptr),
+        table_factory(),
         soft_pending_compaction_bytes_limit(0),
         hard_pending_compaction_bytes_limit(0),
         level0_file_num_compaction_trigger(0),
@@ -323,6 +332,8 @@ struct MutableCFOptions {
 
   // Compaction related options
   bool disable_auto_compactions;
+  std::shared_ptr<ArceDynamicCompaction::ArceCompactionController>
+      arce_compaction_controller;
   std::shared_ptr<TableFactory> table_factory;
   uint64_t soft_pending_compaction_bytes_limit;
   uint64_t hard_pending_compaction_bytes_limit;

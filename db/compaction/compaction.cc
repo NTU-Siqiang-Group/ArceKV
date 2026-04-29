@@ -70,7 +70,7 @@ void Compaction::FinalizeInputInfo(Version* _input_version) {
   cfd_ = input_version_->cfd();
   if ((cfd_->ioptions().compaction_style == kCompactionStyleTiered &&
        start_level_ != output_level_) ||
-      cfd_->ioptions().compaction_style == kCompactionStyleUDP) {
+      cfd_->ioptions().compaction_style == kCompactionStyleArce) {
     output_sorted_run_id_ = input_version_->version_set()->NewSortedRunId();
   }
 
@@ -569,7 +569,7 @@ bool Compaction::IsTrivialMove() const {
   // filter to be applied to that level, and thus cannot be a trivial move.
 
   if (immutable_options_.compaction_style == kCompactionStyleTiered ||
-      immutable_options_.compaction_style == kCompactionStyleUDP) {
+      immutable_options_.compaction_style == kCompactionStyleArce) {
     // Sorted-run compaction must merge runs into a newly written run. A
     // metadata-only move would preserve the old file layout and overlapping
     // runs, which is not equivalent.

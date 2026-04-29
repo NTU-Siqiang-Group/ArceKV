@@ -1802,7 +1802,7 @@ class TieredVersionReadTest : public VersionSetTest {
     cf_options_.compaction_style = kCompactionStyleTiered;
   }
 
-  void EnableUDPReads() { cf_options_.compaction_style = kCompactionStyleUDP; }
+  void EnableArceReads() { cf_options_.compaction_style = kCompactionStyleArce; }
 
   void UseBlockBasedTableFactory(
       const std::shared_ptr<const FilterPolicy>& filter_policy) {
@@ -2191,8 +2191,8 @@ TEST_F(TieredVersionReadTest, LargerMultiLevelTieredReadsRemainOrdered) {
   ASSERT_EQ(expected, ScanCurrentVersion());
 }
 
-TEST_F(TieredVersionReadTest, UDPGetIgnoresSortedRunIdRecencyOrder) {
-  EnableUDPReads();
+TEST_F(TieredVersionReadTest, ArceGetIgnoresSortedRunIdRecencyOrder) {
+  EnableArceReads();
   NewDB();
 
   InstallMockFiles({
@@ -2206,8 +2206,8 @@ TEST_F(TieredVersionReadTest, UDPGetIgnoresSortedRunIdRecencyOrder) {
   ASSERT_EQ("new-low-run-id", GetFromCurrentVersion("k"));
 }
 
-TEST_F(TieredVersionReadTest, UDPIteratorMergesUnorderedOverlappingRuns) {
-  EnableUDPReads();
+TEST_F(TieredVersionReadTest, ArceIteratorMergesUnorderedOverlappingRuns) {
+  EnableArceReads();
   NewDB();
 
   InstallMockFiles({
@@ -2228,8 +2228,8 @@ TEST_F(TieredVersionReadTest, UDPIteratorMergesUnorderedOverlappingRuns) {
 }
 
 TEST_F(TieredVersionReadTest,
-       UDPBloomUsefulMissDoesNotCauseFalseNegative) {
-  EnableUDPReads();
+       ArceBloomUsefulMissDoesNotCauseFalseNegative) {
+  EnableArceReads();
   UseBlockBasedTableFactory(std::make_shared<ExactFilterPolicy>());
   NewDB();
 
@@ -2255,8 +2255,8 @@ TEST_F(TieredVersionReadTest,
 }
 
 TEST_F(TieredVersionReadTest,
-       UDPBloomFalsePositiveIsHandledByMergeIterator) {
-  EnableUDPReads();
+       ArceBloomFalsePositiveIsHandledByMergeIterator) {
+  EnableArceReads();
   UseBlockBasedTableFactory(
       std::shared_ptr<const FilterPolicy>(NewBloomFilterPolicy(1)));
   NewDB();

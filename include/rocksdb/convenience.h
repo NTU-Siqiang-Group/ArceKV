@@ -160,7 +160,7 @@ struct ConfigOptions {
 //     "kSnappyCompression", "kZlibCompression", "kBZip2Compression", ...
 //   - CompactionStyle: valid values are "kCompactionStyleLevel",
 //     "kCompactionStyleUniversal", "kCompactionStyleFIFO",
-//     "kCompactionStyleTiered", "kCompactionStyleUDP", and
+//     "kCompactionStyleTiered", "kCompactionStyleArce", and
 //     "kCompactionStyleNone".
 //
 

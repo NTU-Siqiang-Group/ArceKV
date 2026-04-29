@@ -13,7 +13,7 @@
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_tiered.h"
-#include "db/compaction/compaction_picker_udp.h"
+#include "db/compaction/compaction_picker_arce.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/compaction/file_pri.h"
 #include "rocksdb/advanced_options.h"
@@ -643,15 +643,24 @@ TEST_F(CompactionPickerTest, TieredCompactRangePicksWholeLevel) {
   ASSERT_EQ(22U, compaction->input(0, 3)->fd.GetNumber());
 }
 
-TEST_F(CompactionPickerTest, UDPNeedsCompactionWithoutScores) {
-  ioptions_.compaction_style = kCompactionStyleUDP;
+TEST_F(CompactionPickerTest, ArceNeedsCompactionWithoutScores) {
+  ioptions_.compaction_style = kCompactionStyleArce;
   mutable_cf_options_.RefreshDerivedOptions(ioptions_);
-  NewVersionStorage(3, kCompactionStyleUDP);
+  auto controller =
+      std::make_shared<ArceDynamicCompaction::ArceCompactionController>();
+  controller->enable_dynamic_parameter_selection = false;
+  controller->SetMc({100, 1000000});
+  controller->SetWorkload(/*r=*/100, /*u=*/0, /*p=*/0);
+  mutable_cf_options_.arce_compaction_controller = controller;
+  NewVersionStorage(3, kCompactionStyleArce);
 
-  Add(2, 11U, "100", "149", 1, 0, 100, 100, 0, false,
+  Add(1, 11U, "100", "149", 1, 0, 100, 100, 0, false,
       Temperature::kUnknown, kUnknownOldestAncesterTime,
       kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
-  Add(2, 21U, "120", "169", 1, 0, 100, 100, 0, false,
+  Add(1, 12U, "150", "199", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 21U, "120", "169", 1, 0, 100, 100, 0, false,
       Temperature::kUnknown, kUnknownOldestAncesterTime,
       kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
   Add(2, 31U, "130", "139", 1, 0, 100, 100, 0, false,
@@ -659,23 +668,148 @@ TEST_F(CompactionPickerTest, UDPNeedsCompactionWithoutScores) {
       kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 30);
   UpdateVersionStorageInfo();
 
-  UDPCompactionPicker udp_compaction_picker(ioptions_, &icmp_);
-  ASSERT_TRUE(udp_compaction_picker.NeedsCompaction(vstorage_.get()));
+  ArceCompactionPicker arce_compaction_picker(ioptions_, &icmp_);
+  ASSERT_TRUE(arce_compaction_picker.NeedsCompaction(vstorage_.get()));
   for (int level = 0; level < vstorage_->num_levels(); ++level) {
     ASSERT_EQ(0.0, vstorage_->CompactionScore(level));
   }
 
   std::unique_ptr<Compaction> compaction(
-      udp_compaction_picker.PickCompaction(
+      arce_compaction_picker.PickCompaction(
           cf_name_, mutable_cf_options_, mutable_db_options_,
           /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
           vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
   ASSERT_NE(nullptr, compaction.get());
-  ASSERT_EQ(2, compaction->start_level());
+  ASSERT_EQ(1, compaction->start_level());
   ASSERT_EQ(2, compaction->output_level());
-  ASSERT_EQ(1U, compaction->num_input_levels());
-  ASSERT_GE(compaction->num_input_files(0), 1U);
-  ASSERT_LE(compaction->num_input_files(0), 3U);
+  ASSERT_EQ(2U, compaction->num_input_levels());
+  ASSERT_EQ(3U, compaction->num_input_files(0));
+  ASSERT_EQ(11U, compaction->input(0, 0)->fd.GetNumber());
+  ASSERT_EQ(12U, compaction->input(0, 1)->fd.GetNumber());
+  ASSERT_EQ(21U, compaction->input(0, 2)->fd.GetNumber());
+  ASSERT_EQ(1U, compaction->num_input_files(1));
+  ASSERT_EQ(31U, compaction->input(1, 0)->fd.GetNumber());
+}
+
+TEST_F(CompactionPickerTest, ArceCompactionPressureCountsLogicalRuns) {
+  ioptions_.compaction_style = kCompactionStyleArce;
+  mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+  mutable_cf_options_.arce_compaction_controller =
+      std::make_shared<ArceDynamicCompaction::ArceCompactionController>();
+  NewVersionStorage(3, kCompactionStyleArce);
+
+  Add(0, 1U, "000", "009", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 1);
+  Add(0, 2U, "010", "019", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 2);
+
+  Add(1, 11U, "100", "109", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 12U, "110", "119", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 13U, "120", "129", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+
+  Add(2, 21U, "200", "209", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  Add(2, 22U, "210", "219", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  Add(2, 23U, "220", "229", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  Add(2, 24U, "230", "239", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  UpdateVersionStorageInfo();
+
+  ASSERT_EQ(2U, vstorage_->NumLevelFiles(0));
+  ASSERT_EQ(1U, vstorage_->NumSortedRuns(1));
+  ASSERT_EQ(1U, vstorage_->NumSortedRuns(2));
+  ASSERT_EQ(
+      4, ColumnFamilyData::GetCompactionPressureTokenCount(
+             vstorage_.get(), mutable_cf_options_, ioptions_));
+}
+
+TEST_F(CompactionPickerTest, ArceWorkloadProportionsNormalizeByBufferAndEntry) {
+  ArceDynamicCompaction::ArceCompactionController controller;
+  controller.SetBufferSize(64L * 1024L * 1024L);
+  controller.SetEntrySize(1024);
+  controller.SetWorkloadProportions(0.2, 0.4, 0.4);
+
+  auto [r, u, p] = controller.GetWorkload();
+  ASSERT_EQ(65536, u);
+  ASSERT_EQ(32768, r);
+  ASSERT_EQ(65536, p);
+}
+
+TEST_F(CompactionPickerTest, ArceWriteStallUsesLogicalRunThresholds) {
+  ioptions_.compaction_style = kCompactionStyleArce;
+  mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+  auto controller =
+      std::make_shared<ArceDynamicCompaction::ArceCompactionController>();
+  controller->enable_dynamic_parameter_selection = false;
+  controller->SetMc({100, 2});
+  mutable_cf_options_.arce_compaction_controller = controller;
+  mutable_cf_options_.max_write_buffer_number = 10;
+  NewVersionStorage(3, kCompactionStyleArce);
+
+  Add(0, 1U, "000", "009", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 1);
+  Add(0, 2U, "010", "019", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 2);
+  Add(1, 11U, "100", "109", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 12U, "110", "119", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(1, 13U, "120", "129", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 10);
+  Add(2, 21U, "200", "209", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  Add(2, 22U, "210", "219", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  Add(2, 23U, "220", "229", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  Add(2, 24U, "230", "239", 1, 0, 100, 100, 0, false,
+      Temperature::kUnknown, kUnknownOldestAncesterTime,
+      kUnknownNewestKeyTime, Slice(), Slice(), kUnknownEpochNumber, 20);
+  UpdateVersionStorageInfo();
+
+  const int pressure = ColumnFamilyData::GetCompactionPressureTokenCount(
+      vstorage_.get(), mutable_cf_options_, ioptions_);
+  ASSERT_EQ(4, pressure);
+
+  auto [condition, cause] = ColumnFamilyData::GetWriteStallConditionAndCause(
+      /*num_unflushed_memtables=*/0, pressure,
+      /*num_compaction_needed_bytes=*/0, mutable_cf_options_, ioptions_);
+  ASSERT_EQ(WriteStallCondition::kDelayed, condition);
+  ASSERT_EQ(WriteStallCause::kL0FileCountLimit, cause);
+
+  std::tie(condition, cause) = ColumnFamilyData::GetWriteStallConditionAndCause(
+      /*num_unflushed_memtables=*/0, /*num_l0_files=*/8,
+      /*num_compaction_needed_bytes=*/0, mutable_cf_options_, ioptions_);
+  ASSERT_EQ(WriteStallCondition::kStopped, condition);
+  ASSERT_EQ(WriteStallCause::kL0FileCountLimit, cause);
+
+  std::tie(condition, cause) = ColumnFamilyData::GetWriteStallConditionAndCause(
+      /*num_unflushed_memtables=*/10, /*num_l0_files=*/0,
+      /*num_compaction_needed_bytes=*/0, mutable_cf_options_, ioptions_);
+  ASSERT_EQ(WriteStallCondition::kStopped, condition);
+  ASSERT_EQ(WriteStallCause::kMemtableLimit, cause);
 }
 
 TEST_F(CompactionPickerTest, LevelMaxScore) {

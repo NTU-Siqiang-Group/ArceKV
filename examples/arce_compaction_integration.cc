@@ -60,9 +60,9 @@ constexpr auto kShapePollInterval = std::chrono::seconds(1);
 constexpr auto kShapeWaitTimeout = std::chrono::minutes(2);
 #if defined(OS_WIN)
 const char kDefaultDbPath[] =
-    "C:\\Windows\\TEMP\\rocksdb_udp_compaction_integration";
+    "C:\\Windows\\TEMP\\rocksdb_arce_compaction_integration";
 #else
-const char kDefaultDbPath[] = "/tmp/rocksdb_udp_compaction_integration";
+const char kDefaultDbPath[] = "/tmp/rocksdb_arce_compaction_integration";
 #endif
 
 struct Config {
@@ -539,7 +539,7 @@ int main(int argc, char** argv) {
   const uint64_t permutation_step =
       ChoosePermutationStep(key_count, config.seed ^ 0x94d049bb133111ebULL);
 
-  std::cout << "UDP compaction integration run" << std::endl;
+  std::cout << "Arce compaction integration run" << std::endl;
   std::cout << "  db_path: " << config.db_path << std::endl;
   if (!config.structure_output_path.empty()) {
     std::cout << "  structure_output_path: " << config.structure_output_path
@@ -552,7 +552,7 @@ int main(int argc, char** argv) {
   std::cout << "  key count: " << key_count << std::endl;
   std::cout << "  write_buffer_size: "
             << FormatBytes(config.write_buffer_size) << std::endl;
-  std::cout << "  UDP picker threshold seed: " << config.seed << std::endl;
+  std::cout << "  Arce picker threshold seed: " << config.seed << std::endl;
   std::cout << "  max_background_jobs: ";
   if (config.max_background_jobs.has_value()) {
     std::cout << *config.max_background_jobs << " (override)";
@@ -565,7 +565,7 @@ int main(int argc, char** argv) {
   options.create_if_missing = true;
   options.error_if_exists = true;
   options.compression = rocksdb::kNoCompression;
-  options.compaction_style = rocksdb::kCompactionStyleUDP;
+  options.compaction_style = rocksdb::kCompactionStyleArce;
   options.disable_auto_compactions = false;
   options.write_buffer_size = config.write_buffer_size;
   options.target_file_size_base = config.target_file_size_base;
@@ -661,7 +661,7 @@ int main(int argc, char** argv) {
         return file.level > 0 || file.sorted_run_id != 0;
       });
   if (!saw_compaction) {
-    Die("UDP integration run did not observe any compaction output");
+    Die("Arce integration run did not observe any compaction output");
   }
 
   const std::string tree_description = DescribeTree(live_files);
@@ -673,7 +673,7 @@ int main(int argc, char** argv) {
     std::cout << "  L" << level.level << ": runs=" << level.run_count
               << " files=" << level.file_count << std::endl;
   }
-  std::cout << "UDP tree: " << tree_description << std::endl;
+  std::cout << "Arce tree: " << tree_description << std::endl;
   WriteStructureReport(config, live_files, tree_description);
 
   std::vector<double> point_latencies;
